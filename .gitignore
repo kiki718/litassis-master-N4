@@ -1,0 +1,11 @@
+.env
+__pycache__
+*.pyc
+.venv/
+.idea/
+.agents/
+logs/
+outputs/
+data/cache/
+*.log
+*.pdf

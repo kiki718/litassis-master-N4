@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>文献助手</title>
+    <link rel="stylesheet" href="styles.css" />
+    <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">LA</div>
+          <div>
+            <strong>文献助手</strong>
+            <span>觅音计划</span>
+          </div>
+        </div>
+
+        <nav class="nav" aria-label="主导航">
+          <button class="nav-item active" data-view="workspace" title="工作台">
+            <i data-lucide="layout-dashboard"></i><span>工作台</span>
+          </button>
+          <button class="nav-item" data-view="papers" title="文献">
+            <i data-lucide="library-big"></i><span>文献</span>
+          </button>
+          <button class="nav-item" data-view="summaries" title="摘要">
+            <i data-lucide="notebook-text"></i><span>摘要</span>
+          </button>
+          <button class="nav-item" data-view="hotspots" title="热点">
+            <i data-lucide="flame"></i><span>热点</span>
+          </button>
+          <button class="nav-item" data-view="export" title="导出">
+            <i data-lucide="file-json-2"></i><span>导出</span>
+          </button>
+        </nav>
+
+        <div class="run-state">
+          <span class="state-dot"></span>
+          <div>
+            <strong id="runLabel">样例数据</strong>
+            <span id="runMeta">221 个观测目标</span>
+          </div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h1>话题文献与候选目标分析</h1>
+            <p>话题检索、中文摘要、候选观测目标提取与热度排序</p>
+          </div>
+          <div class="toolbar">
+            <div class="topic-input">
+              <i data-lucide="search"></i>
+              <input id="topicInput" value="分布式光干涉" placeholder="输入感兴趣的话题" />
+            </div>
+            <label class="icon-button" title="导入参考目标表">
+              <i data-lucide="upload"></i>
+              <input id="csvInput" type="file" accept=".csv" />
+            </label>
+            <label class="icon-button" title="导入热点 JSON">
+              <i data-lucide="braces"></i>
+              <input id="jsonInput" type="file" accept=".json" />
+            </label>
+            <label class="select-control" title="文献扒取时间范围">
+              <i data-lucide="calendar-range"></i>
+              <select id="timeframeSelect" aria-label="文献扒取时间范围">
+                <option value="1">一个月</option>
+                <option value="6">半年</option>
+                <option value="12" selected>一年</option>
+                <option value="24">两年</option>
+                <option value="36">三年</option>
+                <option value="60">五年</option>
+                <option value="custom">自定义</option>
+              </select>
+            </label>
+            <label class="custom-months" id="customMonthsWrap" title="自定义扒取月数">
+              <input id="customMonthsInput" type="number" min="1" max="240" value="18" />
+              <span>个月</span>
+            </label>
+            <label class="select-control" title="文献采集上限">
+              <i data-lucide="database"></i>
+              <select id="paperLimitSelect" aria-label="文献采集上限">
+                <option value="200" selected>200篇</option>
+                <option value="500">500篇</option>
+                <option value="1000">1000篇</option>
+                <option value="0">无上限</option>
+              </select>
+            </label>
+            <button class="secondary-button" id="openDeepseekConfig">
+              <i data-lucide="key-round"></i>
+              <span>DeepSeek</span>
+            </button>
+            <button class="primary-button" id="simulateRun">
+              <i data-lucide="sparkles"></i>
+              <span>生成分析</span>
+            </button>
+            <button class="icon-button" id="downloadJson" title="下载 hotspots JSON">
+              <i data-lucide="download"></i>
+            </button>
+          </div>
+        </header>
+
+        <section class="status-strip">
+          <div class="metric">
+            <span>提取目标</span>
+            <strong id="targetCount">0</strong>
+          </div>
+          <div class="metric">
+            <span>已匹配热点</span>
+            <strong id="matchedCount">5</strong>
+          </div>
+          <div class="metric warning">
+            <span>未匹配 ID</span>
+            <strong id="unmatchedCount">2</strong>
+          </div>
+          <div class="metric">
+            <span>代表性文献</span>
+            <strong id="paperCount">12</strong>
+          </div>
+          <div class="metric accent">
+            <span>最高热度</span>
+            <strong id="topHeat">95.5</strong>
+          </div>
+        </section>
+
+        <div class="notice-bar" id="runNotice">
+          后端已连接。未配置 DeepSeek API 时，将使用 arXiv 检索和本地启发式分析。
+        </div>
+
+        <section class="topic-summary-band" id="topicSummaryBand">
+          <div>
+            <span>话题摘要</span>
+            <strong id="topicSummaryTitle">分布式光干涉</strong>
+          </div>
+          <p id="topicSummaryText">输入话题并点击“生成分析”后，这里会显示面向跨专业用户的中文摘要。</p>
+        </section>
+
+        <section class="view active" id="workspace">
+          <div class="workspace-grid">
+            <section class="panel target-panel">
+              <div class="panel-head">
+                <div>
+                  <h2>文献提取目标</h2>
+                  <span id="sequenceFile">等待话题检索</span>
+                </div>
+                <div class="segmented">
+                  <button class="active">全部</button>
+                  <button>已匹配</button>
+                  <button>异常</button>
+                </div>
+              </div>
+              <div class="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>ID</th>
+                      <th>匹配目录</th>
+                      <th>相关文献</th>
+                      <th>来源</th>
+                      <th>热度</th>
+                    </tr>
+                  </thead>
+                  <tbody id="targetRows"></tbody>
+                </table>
+              </div>
+            </section>
+
+            <section class="panel detail-panel">
+              <div class="panel-head">
+                <div>
+                  <h2 id="detailTitle">280310048</h2>
+                  <span id="detailSubtitle">热度 95.5 · 已匹配</span>
+                </div>
+                <button class="icon-button small" title="重新分析">
+                  <i data-lucide="refresh-cw"></i>
+                </button>
+              </div>
+              <div class="score-block">
+                <div class="score-ring">
+                  <strong id="detailHeat">95.5</strong>
+                  <span>heat</span>
+                </div>
+                <div class="score-bars">
+                  <label>文献数量<span id="scorePaperCount">0</span></label>
+                  <progress id="scorePaperCountBar" value="0" max="35"></progress>
+                  <label>近期关注<span id="scoreRecent">0</span></label>
+                  <progress id="scoreRecentBar" value="0" max="25"></progress>
+                  <label>相关性<span id="scoreRelevance">0</span></label>
+                  <progress id="scoreRelevanceBar" value="0" max="25"></progress>
+                  <label>代表性<span id="scoreRepresentative">0</span></label>
+                  <progress id="scoreRepresentativeBar" value="0" max="15"></progress>
+                </div>
+              </div>
+              <div class="summary-box" id="detailSummary">
+                近期论文集中讨论该目标邻近恒星环境、宜居带成像可行性与干涉观测价值，适合作为高优先级候选目标进入后续筛选。
+              </div>
+              <div class="paper-section-title" id="detailPapersTitle">代表性文献</div>
+              <div class="paper-list" id="detailPapers"></div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view" id="papers">
+          <div class="panel full-panel">
+            <div class="panel-head">
+              <div>
+                <h2>文献检索结果</h2>
+                <span>按目标相关性排序</span>
+              </div>
+              <div class="search-box">
+                <i data-lucide="search"></i>
+                <input id="paperSearch" placeholder="检索标题、来源或目标 ID" />
+              </div>
+            </div>
+            <div class="paper-grid" id="paperGrid"></div>
+          </div>
+        </section>
+
+        <section class="view" id="summaries">
+          <div class="panel full-panel">
+            <div class="panel-head">
+              <div>
+                <h2>中文摘要</h2>
+                <span>主题、结论、目标与科学意义</span>
+              </div>
+              <button class="secondary-button">
+                <i data-lucide="copy"></i>
+                <span>复制摘要</span>
+              </button>
+            </div>
+            <div class="summary-grid" id="summaryGrid"></div>
+          </div>
+        </section>
+
+        <section class="view" id="hotspots">
+          <div class="panel full-panel">
+            <div class="panel-head">
+              <div>
+                <h2>候选目标热点排序</h2>
+                <span>从当前话题文献中提取出的观测目标热度</span>
+              </div>
+              <div class="segmented">
+                <button class="active">热度</button>
+                <button>更新时间</button>
+                <button>文献数</button>
+              </div>
+            </div>
+            <div class="hotspot-list" id="hotspotList"></div>
+          </div>
+        </section>
+
+        <section class="view" id="export">
+          <div class="export-layout">
+            <section class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>导出预览</h2>
+                  <span>hotspots.json</span>
+                </div>
+                <button class="primary-button" id="downloadJsonAlt">
+                  <i data-lucide="download"></i>
+                  <span>下载</span>
+                </button>
+              </div>
+              <pre id="jsonPreview"></pre>
+            </section>
+            <section class="panel">
+              <div class="panel-head">
+                <div>
+                  <h2>格式检查</h2>
+                  <span>AstroLens 输入约束</span>
+                </div>
+              </div>
+              <div class="checks" id="checks"></div>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div class="modal-backdrop" id="deepseekModal" hidden>
+      <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="deepseekTitle">
+        <div class="panel-head">
+          <div>
+            <h2 id="deepseekTitle">DeepSeek 配置</h2>
+            <span id="deepseekStatus">当前状态读取中</span>
+          </div>
+          <button class="icon-button small" id="closeDeepseekConfig" title="关闭">
+            <i data-lucide="x"></i>
+          </button>
+        </div>
+        <div class="form-grid">
+          <label>
+            <span>API Key</span>
+            <input id="deepseekApiKey" type="password" placeholder="sk-..." autocomplete="off" />
+          </label>
+          <label>
+            <span>Base URL</span>
+            <input id="deepseekBaseUrl" value="https://api.deepseek.com/chat/completions" />
+          </label>
+          <label>
+            <span>模型</span>
+            <input id="deepseekModel" value="deepseek-chat" />
+          </label>
+        </div>
+        <div class="modal-actions">
+          <button class="secondary-button" id="testDeepseekConfig">
+            <i data-lucide="activity"></i>
+            <span>检查状态</span>
+          </button>
+          <button class="primary-button" id="saveDeepseekConfig">
+            <i data-lucide="save"></i>
+            <span>保存配置</span>
+          </button>
+        </div>
+        <div class="notice-bar" id="deepseekConfigNotice">保存后会写入项目目录的 .env，并立即在当前服务中生效。</div>
+      </section>
+    </div>
+
+    <div class="modal-backdrop" id="paperAnalysisModal" hidden>
+      <section class="modal-panel paper-analysis-panel" role="dialog" aria-modal="true" aria-labelledby="paperAnalysisTitle">
+        <div class="panel-head">
+          <div>
+            <h2 id="paperAnalysisTitle">文献详细分析</h2>
+            <span id="paperAnalysisMeta">等待选择文献</span>
+          </div>
+          <button class="icon-button small" id="closePaperAnalysis" title="关闭">
+            <i data-lucide="x"></i>
+          </button>
+        </div>
+        <div class="paper-analysis-content">
+          <p id="paperAnalysisBody">点击某篇文献后，这里会显示大模型生成的详细中文分析。</p>
+          <ul id="paperAnalysisPoints"></ul>
+          <div class="notice-bar" id="paperAnalysisTargets"></div>
+        </div>
+      </section>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

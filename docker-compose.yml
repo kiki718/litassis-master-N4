@@ -1,0 +1,16 @@
+services:
+  literature-assistant:
+    build: .
+    container_name: literature-assistant
+    ports:
+      - "5179:5179"
+    env_file:
+      - .env
+    environment:
+      HOST: 0.0.0.0
+      PORT: 5179
+    volumes:
+      - ./outputs:/app/outputs
+      - ./logs:/app/logs
+      - ./data/cache:/app/data/cache
+    restart: unless-stopped

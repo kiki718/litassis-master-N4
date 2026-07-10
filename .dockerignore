@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+data/cache/
+logs/
+outputs/
+dist/
+.git/
+.gitignore
+*.zip
