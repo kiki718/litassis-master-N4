@@ -53,6 +53,8 @@ let papers = [
 let topicSummary = null;
 let currentTopic = "分布式光干涉";
 let paperRecords = new Map();
+let parseTasks = new Map();
+let activeParsePolls = new Set();
 
 const targetRows = document.querySelector("#targetRows");
 const paperGrid = document.querySelector("#paperGrid");
@@ -206,6 +208,75 @@ function paperFetchStatus(record) {
   return { label: "PDF未获取", className: "pending", title: record.failure_reason || "尚未尝试获取 PDF" };
 }
 
+function paperParseStatus(record, task = null) {
+  if (task && ["queued", "running"].includes(task.status)) {
+    return { label: task.status === "queued" ? "排队中" : "解析中", className: "pending", title: task.progress_stage || task.message || "MinerU 解析任务正在执行" };
+  }
+  if (!record || record.fetch_status !== "success") {
+    return { label: "未解析", className: "pending", title: "请先成功获取 PDF" };
+  }
+  if (record.parse_status === "success") {
+    return { label: "解析成功", className: "ok", title: record.markdown_path || "Markdown 已保存" };
+  }
+  if (record.parse_status === "need_review") {
+    return { label: "需复核", className: "warn", title: record.parse_error || "MinerU 已生成结果，但需人工复核" };
+  }
+  if (record.parse_status === "failed") {
+    return { label: "解析失败", className: "error", title: record.parse_error || "MinerU 解析失败" };
+  }
+  if (record.parse_status === "running") {
+    return { label: "解析中", className: "pending", title: "MinerU 解析任务正在执行" };
+  }
+  return { label: "未解析", className: "pending", title: "尚未启动 MinerU 解析" };
+}
+
+function taskTimestamp(task) {
+  return Date.parse(task?.updated_at || task?.created_at || "") || 0;
+}
+
+function mergeParseTask(task) {
+  if (!task?.task_id) return;
+  const key = task.paper_id || task.task_id;
+  const existing = parseTasks.get(key);
+  if (existing && existing.task_id !== task.task_id && taskTimestamp(task) < taskTimestamp(existing)) {
+    return;
+  }
+  parseTasks.set(key, task);
+  if (task.record) mergePaperRecord(task.record);
+}
+
+function taskForPaper(record) {
+  if (!record?.paper_id) return null;
+  return parseTasks.get(record.paper_id) || null;
+}
+
+function latestTaskForPaperId(paperId) {
+  if (!paperId) return null;
+  return parseTasks.get(paperId) || null;
+}
+
+function parseProgressText(task) {
+  if (!task || !["queued", "running"].includes(task.status)) return "";
+  const percent = Number(task.progress_percent);
+  const prefix = Number.isFinite(percent) ? `${Math.max(0, Math.min(100, percent)).toFixed(1)}%` : "";
+  return [prefix, task.progress_stage || task.message || "解析中"].filter(Boolean).join(" · ");
+}
+
+async function restoreActiveParseTask(record) {
+  if (!record?.paper_id || record.fetch_status !== "success" || record.parse_status === "success") return;
+  try {
+    const response = await fetch(`/api/paper/parse-task?paper_id=${encodeURIComponent(record.paper_id)}`);
+    if (!response.ok) return;
+    const payload = await response.json();
+    const task = (payload.items || []).find((item) => ["queued", "running"].includes(item.status));
+    if (!task?.task_id) return;
+    mergeParseTask(task);
+    pollParseTask(task.task_id, null, "解析PDF");
+  } catch (error) {
+    console.warn("parse task restore unavailable", error);
+  }
+}
+
 function mergePaperRecord(record) {
   if (!record?.paper_id) return;
   paperRecords.set(record.paper_id, record);
@@ -217,6 +288,8 @@ function mergePaperRecord(record) {
     paper.paper_record = record;
     paper.fetch_status = record.fetch_status;
     paper.pdf_path = record.pdf_path;
+    paper.parse_status = record.parse_status;
+    paper.markdown_path = record.markdown_path;
   }
 }
 
@@ -234,14 +307,23 @@ function renderPaperItem(paper) {
   const paperIndex = index >= 0 ? index : "";
   const record = recordForPaper(paper);
   const status = paperFetchStatus(record);
+  const task = taskForPaper(record);
+  const parseStatus = paperParseStatus(record, task);
+  const progressText = parseProgressText(task);
+  const progressValue = Math.max(0, Math.min(100, Number(task?.progress_percent || 0)));
   const pdfHref = record?.fetch_status === "success" && record.paper_id
     ? `/api/paper/pdf?paper_id=${encodeURIComponent(record.paper_id)}`
     : "";
+  const canPreviewMarkdown = record?.paper_id && record?.markdown_path && ["success", "need_review"].includes(record?.parse_status);
   return `
     <article class="paper-item" data-paper-index="${paperIndex}">
       <strong>${escapeHtml(paper.title)}</strong>
       <span>${escapeHtml(paper.source || "文献源")} · ${paper.year || "-"} · 目标 ${escapeHtml(paper.targetId || "-")}</span>
-      <div class="paper-fetch-status ${status.className}" title="${escapeHtml(status.title)}">${escapeHtml(status.label)}</div>
+      <div class="paper-status-row">
+        <div class="paper-fetch-status ${status.className}" title="${escapeHtml(status.title)}">${escapeHtml(status.label)}</div>
+        <div class="paper-fetch-status ${parseStatus.className}" title="${escapeHtml(parseStatus.title)}">${escapeHtml(parseStatus.label)}</div>
+      </div>
+      ${progressText ? `<div class="parse-progress"><progress value="${progressValue}" max="100"></progress><span>${escapeHtml(progressText)}</span></div>` : ""}
       <div class="paper-actions">
         <button class="inline-analysis-button" data-paper-index="${paperIndex}" type="button">
           <i data-lucide="sparkles"></i>
@@ -252,6 +334,11 @@ function renderPaperItem(paper) {
           <span>${record?.fetch_status === "success" ? "重新获取PDF" : "获取PDF"}</span>
         </button>
         ${pdfHref ? `<a class="open-pdf-link" href="${pdfHref}" target="_blank" rel="noopener"><i data-lucide="file-text"></i><span>打开PDF</span></a>` : ""}
+        <button class="parse-pdf-button" data-paper-index="${paperIndex}" type="button" ${record?.fetch_status === "success" ? "" : "disabled"}>
+          <i data-lucide="file-cog"></i>
+          <span>${record?.parse_status === "success" ? "重新解析" : "解析PDF"}</span>
+        </button>
+        ${canPreviewMarkdown ? `<button class="preview-markdown-button" data-paper-id="${escapeHtml(record.paper_id)}" type="button"><i data-lucide="book-open-text"></i><span>预览Markdown</span></button>` : ""}
       </div>
     </article>
   `;
@@ -527,6 +614,7 @@ async function loadPaperRecords() {
     papers.forEach((paper) => {
       if (paper.paper_id && paperRecords.has(paper.paper_id)) paper.paper_record = paperRecords.get(paper.paper_id);
     });
+    (payload.items || []).forEach((record) => restoreActiveParseTask(record));
   } catch (error) {
     console.warn("paper records unavailable", error);
   }
@@ -560,6 +648,112 @@ async function fetchPaperPdf(paper, button) {
     if (button) button.disabled = false;
     if (label) label.textContent = originalLabel;
   }
+}
+
+async function parsePaperPdf(paper, button) {
+  const record = recordForPaper(paper);
+  if (!record?.paper_id || record.fetch_status !== "success") {
+    setNotice("请先成功获取 PDF，再启动 MinerU 解析。", "warn");
+    return;
+  }
+  const label = button?.querySelector("span");
+  const originalLabel = label?.textContent || "解析PDF";
+  if (button) button.disabled = true;
+  if (label) label.textContent = "排队中...";
+  setNotice(`已提交《${paper.title || "文献"}》的 MinerU 解析任务，正在等待状态更新。`);
+  try {
+    const response = await fetch("/api/paper/parse", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paper_id: record.paper_id, paper })
+    });
+    const payload = await response.json();
+    if (payload.record) mergePaperRecord(payload.record);
+    if (payload.task) mergeParseTask(payload.task);
+    refreshPaperViews();
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.task?.message || payload.error || `HTTP ${response.status}`);
+    }
+    if (payload.task?.task_id && ["queued", "running"].includes(payload.task.status)) {
+      pollParseTask(payload.task.task_id, button, originalLabel);
+    } else {
+      const status = payload.task?.parse_status || payload.record?.parse_status;
+      setNotice(status === "success" ? "Markdown 已存在，已复用解析结果。" : (payload.task?.message || "解析任务已完成。"), status === "success" ? "ok" : "warn");
+    }
+  } catch (error) {
+    setNotice(`解析任务启动失败：${error.message}`, "error");
+    if (button) button.disabled = false;
+    if (label) label.textContent = originalLabel;
+  }
+}
+
+async function pollParseTask(taskId, button, originalLabel, attempt = 0) {
+  if (attempt === 0 && activeParsePolls.has(taskId)) {
+    if (button) button.disabled = false;
+    const existingLabel = button?.querySelector("span");
+    if (existingLabel) existingLabel.textContent = originalLabel;
+    return;
+  }
+  if (attempt === 0) activeParsePolls.add(taskId);
+  const label = button?.querySelector("span");
+  try {
+    const response = await fetch(`/api/paper/parse-task?task_id=${encodeURIComponent(taskId)}`);
+    const task = await response.json();
+    mergeParseTask(task);
+    refreshPaperViews();
+    if (["queued", "running"].includes(task.status) && attempt < 3600) {
+      const progress = parseProgressText(task);
+      if (label) label.textContent = task.status === "queued" ? "排队中..." : "解析中...";
+      if (progress) setNotice(`MinerU ${progress}`);
+      setTimeout(() => pollParseTask(taskId, button, originalLabel, attempt + 1), 2000);
+      return;
+    }
+    activeParsePolls.delete(taskId);
+    if (button) button.disabled = false;
+    if (label) label.textContent = originalLabel;
+    const latest = latestTaskForPaperId(task.paper_id);
+    if (latest?.task_id && latest.task_id !== task.task_id && ["queued", "running"].includes(latest.status)) {
+      return;
+    }
+    if (task.parse_status === "success") {
+      setNotice("MinerU 解析完成，Markdown 已保存。", "ok");
+    } else if (task.parse_status === "need_review") {
+      setNotice(`MinerU 解析完成但需复核：${task.message || "请预览 Markdown 结构"}`, "warn");
+    } else {
+      setNotice(`MinerU 解析失败：${task.message || "未生成可用 Markdown"}`, "error");
+    }
+  } catch (error) {
+    activeParsePolls.delete(taskId);
+    if (button) button.disabled = false;
+    if (label) label.textContent = originalLabel;
+    setNotice(`解析状态读取失败：${error.message}`, "error");
+  }
+}
+
+async function openMarkdownPreview(paperId) {
+  const modal = document.querySelector("#markdownPreviewModal");
+  const body = document.querySelector("#markdownPreviewBody");
+  const meta = document.querySelector("#markdownPreviewMeta");
+  if (!modal || !body) return;
+  modal.hidden = false;
+  body.textContent = "正在读取 Markdown...";
+  const record = paperRecords.get(paperId);
+  meta.textContent = record?.markdown_path || paperId;
+  try {
+    const response = await fetch(`/api/paper/markdown?paper_id=${encodeURIComponent(paperId)}`);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    body.textContent = await response.text();
+    if (record?.parse_status === "need_review") {
+      meta.textContent = `${record.markdown_path || paperId} · 需人工复核`;
+    }
+  } catch (error) {
+    body.textContent = `Markdown 读取失败：${error.message}`;
+  }
+}
+
+function closeMarkdownPreview() {
+  const modal = document.querySelector("#markdownPreviewModal");
+  if (modal) modal.hidden = true;
 }
 
 function resetAnalysisState(topic = "") {
@@ -710,6 +904,20 @@ document.addEventListener("click", (event) => {
   if (!Number.isInteger(index) || !papers[index]) return;
   fetchPaperPdf(papers[index], button);
 });
+
+document.addEventListener("click", (event) => {
+  const button = event.target.closest(".parse-pdf-button");
+  if (!button) return;
+  const index = Number(button.dataset.paperIndex);
+  if (!Number.isInteger(index) || !papers[index]) return;
+  parsePaperPdf(papers[index], button);
+});
+
+document.addEventListener("click", (event) => {
+  const button = event.target.closest(".preview-markdown-button");
+  if (!button?.dataset.paperId) return;
+  openMarkdownPreview(button.dataset.paperId);
+});
 document.querySelector("#timeframeSelect").addEventListener("change", () => {
   updateCustomMonthsVisibility();
   setNotice(`已选择扒取最近${timeframeLabel()}的文献。点击“生成分析”后生效。`);
@@ -790,6 +998,10 @@ document.querySelector("#deepseekModal").addEventListener("click", (event) => {
 document.querySelector("#closePaperAnalysis").addEventListener("click", closePaperAnalysisModal);
 document.querySelector("#paperAnalysisModal").addEventListener("click", (event) => {
   if (event.target.id === "paperAnalysisModal") closePaperAnalysisModal();
+});
+document.querySelector("#closeMarkdownPreview").addEventListener("click", closeMarkdownPreview);
+document.querySelector("#markdownPreviewModal").addEventListener("click", (event) => {
+  if (event.target.id === "markdownPreviewModal") closeMarkdownPreview();
 });
 
 renderAll();

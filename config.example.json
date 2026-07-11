@@ -3,6 +3,23 @@
   "fallback_target_file": "221.csv",
   "hotspots_file": "test_hotspots.json",
   "output_file": "outputs/hotspots.json",
+  "paper_records_file": "outputs/paper_records.json",
+  "pdf_dir": "outputs/pdfs",
+  "markdown_dir": "outputs/markdown",
+  "parse_tasks_dir": "outputs/parse_tasks",
+  "mineru_adapter": {
+    "mode": "command",
+    "command": "mineru",
+    "args": ["-p", "{pdf_path}", "-o", "{output_dir}", "-b", "pipeline", "-m", "auto"],
+    "timeout_seconds": 7200,
+    "service_url": ""
+  },
+  "mineru_models": {
+    "auto_prepare": true,
+    "source": "modelscope",
+    "model_type": "pipeline",
+    "timeout_seconds": 7200
+  },
   "cache_dir": "data/cache",
   "max_targets_per_run": 12,
   "max_papers_per_target": 5,

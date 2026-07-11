@@ -10,11 +10,14 @@ import json
 import math
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from http import HTTPStatus
@@ -36,7 +39,22 @@ DEFAULT_CONFIG = {
     "literature_corpus_file": "outputs/literature_corpus.md",
     "paper_records_file": "outputs/paper_records.json",
     "pdf_dir": "outputs/pdfs",
+    "markdown_dir": "outputs/markdown",
+    "parse_tasks_dir": "outputs/parse_tasks",
     "max_pdf_bytes": 80 * 1024 * 1024,
+    "mineru_adapter": {
+        "mode": "command",
+        "command": "mineru",
+        "args": ["-p", "{pdf_path}", "-o", "{output_dir}"],
+        "timeout_seconds": 7200,
+        "service_url": "",
+    },
+    "mineru_models": {
+        "auto_prepare": True,
+        "source": "modelscope",
+        "model_type": "pipeline",
+        "timeout_seconds": 7200,
+    },
     "cache_dir": "data/cache",
     "max_targets_per_run": 12,
     "max_papers_per_target": 5,
@@ -97,6 +115,27 @@ class PaperRecord:
     pdf_path: str | None = None
     markdown_path: str | None = None
     parse_status: str = "not_started"
+    parse_error: str | None = None
+    parse_time: str | None = None
+    parser: str | None = None
+
+
+@dataclass
+class ParseTask:
+    task_id: str
+    paper_id: str
+    status: str = "queued"
+    created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    updated_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    started_at: str | None = None
+    completed_at: str | None = None
+    message: str | None = None
+    markdown_path: str | None = None
+    parse_status: str = "not_started"
+    progress_percent: float | None = None
+    progress_stage: str | None = None
+    worker_pid: int | None = None
+    record: dict[str, Any] | None = None
 
 
 @dataclass
@@ -169,6 +208,8 @@ def ensure_dirs() -> None:
     (ROOT / CONFIG["cache_dir"]).mkdir(parents=True, exist_ok=True)
     (ROOT / "outputs").mkdir(parents=True, exist_ok=True)
     (ROOT / CONFIG.get("pdf_dir", "outputs/pdfs")).mkdir(parents=True, exist_ok=True)
+    (ROOT / CONFIG.get("markdown_dir", "outputs/markdown")).mkdir(parents=True, exist_ok=True)
+    (ROOT / CONFIG.get("parse_tasks_dir", "outputs/parse_tasks")).mkdir(parents=True, exist_ok=True)
     (ROOT / "logs").mkdir(parents=True, exist_ok=True)
 
 
@@ -1552,6 +1593,613 @@ def paper_record_payload(paper: Paper, payload: dict[str, Any] | None = None) ->
     return asdict(record) if record else None
 
 
+def parse_tasks_dir() -> Path:
+    return ROOT / CONFIG.get("parse_tasks_dir", "outputs/parse_tasks")
+
+
+def parse_task_path(task_id: str) -> Path:
+    return parse_tasks_dir() / f"{safe_filename(task_id, 80)}.json"
+
+
+def load_parse_task(task_id: str) -> ParseTask | None:
+    path = parse_task_path(task_id)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    try:
+        return ParseTask(**data)
+    except TypeError:
+        allowed = {field.name for field in ParseTask.__dataclass_fields__.values()}
+        return ParseTask(**{key: value for key, value in data.items() if key in allowed})
+
+
+def save_parse_task(task: ParseTask) -> None:
+    ensure_dirs()
+    task.updated_at = datetime.now().isoformat(timespec="seconds")
+    parse_task_path(task.task_id).write_text(json.dumps(asdict(task), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def latest_parse_task_for_paper(paper_id: str, statuses: set[str] | None = None) -> ParseTask | None:
+    ensure_dirs()
+    latest: ParseTask | None = None
+    latest_time = ""
+    for task_file in parse_tasks_dir().glob("*.json"):
+        try:
+            data = json.loads(task_file.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if data.get("paper_id") != paper_id:
+            continue
+        if statuses and data.get("status") not in statuses:
+            continue
+        task = load_parse_task(str(data.get("task_id") or ""))
+        if not task:
+            continue
+        task_time = task.updated_at or task.created_at or ""
+        if not latest or task_time > latest_time:
+            latest = task
+            latest_time = task_time
+    return refresh_parse_task(latest) if latest else None
+
+
+def parse_lock_path() -> Path:
+    return parse_tasks_dir() / "mineru_parse.lock"
+
+
+def acquire_parse_lock(task: ParseTask, max_wait_seconds: int = 60 * 60 * 3) -> bool:
+    start = time.time()
+    lock_path = parse_lock_path()
+    while True:
+        try:
+            with lock_path.open("x", encoding="utf-8") as file:
+                file.write(json.dumps({"task_id": task.task_id, "paper_id": task.paper_id, "time": datetime.now().isoformat(timespec="seconds")}, ensure_ascii=False))
+            return True
+        except FileExistsError:
+            if time.time() - start > max_wait_seconds:
+                task.status = "failed"
+                task.parse_status = "failed"
+                task.message = "等待 MinerU 解析锁超时"
+                task.completed_at = datetime.now().isoformat(timespec="seconds")
+                save_parse_task(task)
+                return False
+            task.status = "queued"
+            task.parse_status = "queued"
+            task.progress_percent = 0
+            task.progress_stage = "等待其他 MinerU 任务完成"
+            task.message = "已有 MinerU 任务运行中，当前任务排队等待"
+            save_parse_task(task)
+            time.sleep(3)
+
+
+def release_parse_lock(task_id: str) -> None:
+    lock_path = parse_lock_path()
+    if not lock_path.exists():
+        return
+    try:
+        data = json.loads(lock_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        data = {}
+    if data.get("task_id") in {None, task_id}:
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
+
+
+def process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def resolve_record_pdf_path(record: PaperRecord) -> Path | None:
+    if not record.pdf_path:
+        return None
+    pdf_path = (ROOT / record.pdf_path).resolve()
+    pdf_root = (ROOT / CONFIG.get("pdf_dir", "outputs/pdfs")).resolve()
+    try:
+        pdf_path.relative_to(pdf_root)
+    except ValueError:
+        return None
+    return pdf_path if pdf_path.exists() else None
+
+
+def resolve_record_markdown_path(record: PaperRecord) -> Path | None:
+    if not record.markdown_path:
+        return None
+    md_path = (ROOT / record.markdown_path).resolve()
+    md_root = (ROOT / CONFIG.get("markdown_dir", "outputs/markdown")).resolve()
+    try:
+        md_path.relative_to(md_root)
+    except ValueError:
+        return None
+    return md_path if md_path.exists() else None
+
+
+def mineru_runtime_dir(record: PaperRecord) -> Path:
+    path = ROOT / "outputs" / "mineru_runtime" / safe_filename(record.paper_id, 80)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def mineru_safe_pdf_path(record: PaperRecord, source_pdf_path: Path) -> Path:
+    runtime_dir = mineru_runtime_dir(record)
+    target = runtime_dir / "input.pdf"
+    try:
+        if not target.exists() or target.stat().st_size != source_pdf_path.stat().st_size:
+            shutil.copy2(source_pdf_path, target)
+    except OSError:
+        shutil.copy2(source_pdf_path, target)
+    return target
+
+
+def find_markdown_output(output_dir: Path, preferred_path: Path) -> Path | None:
+    if preferred_path.exists() and preferred_path.stat().st_size > 0:
+        return preferred_path
+    candidates = [path for path in output_dir.rglob("*.md") if path.is_file() and path.stat().st_size > 0]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda path: (path.stat().st_size, path.stat().st_mtime), reverse=True)
+    return candidates[0]
+
+
+def markdown_needs_review(markdown_path: Path) -> str | None:
+    try:
+        text = markdown_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"Markdown 读取失败：{exc}"
+    stripped = text.strip()
+    if len(stripped) < 500:
+        return "Markdown 文本过短，需人工复核"
+    headings = len(re.findall(r"^#{1,6}\s+", stripped, flags=re.MULTILINE))
+    if headings < 2:
+        return "Markdown 章节结构较弱，需人工复核"
+    return None
+
+
+def read_log_tail(path: Path, max_chars: int = 1200) -> str:
+    if not path.exists():
+        return ""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    return text[-max_chars:].strip()
+
+
+def config_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return default
+
+
+def mineru_models_config(adapter_config: dict[str, Any]) -> dict[str, Any]:
+    config = dict(CONFIG.get("mineru_models") or {})
+    nested = adapter_config.get("models") if isinstance(adapter_config, dict) else None
+    if isinstance(nested, dict):
+        config.update(nested)
+    return config
+
+
+def resolve_mineru_model_downloader(adapter_config: dict[str, Any]) -> str:
+    model_config = mineru_models_config(adapter_config)
+    candidates: list[str] = []
+    configured = clean_text(str(model_config.get("command") or ""))
+    if configured:
+        candidates.append(configured)
+    adapter_command = clean_text(str(adapter_config.get("command") or "mineru"))
+    if adapter_command:
+        command_path = Path(adapter_command)
+        if command_path.exists():
+            suffix = ".exe" if command_path.suffix.lower() == ".exe" else ""
+            candidates.append(str(command_path.with_name(f"mineru-models-download{suffix}")))
+    if os.name == "nt":
+        candidates.append(str(ROOT / ".mineru-venv" / "Scripts" / "mineru-models-download.exe"))
+    candidates.append("mineru-models-download")
+    for candidate in candidates:
+        executable = shutil.which(candidate) or (candidate if Path(candidate).exists() else "")
+        if executable:
+            return executable
+    return ""
+
+
+def prepare_mineru_models(adapter_config: dict[str, Any], output_dir: Path) -> tuple[bool, str | None]:
+    model_config = mineru_models_config(adapter_config)
+    if not config_bool(model_config.get("auto_prepare"), True):
+        return True, None
+    downloader = resolve_mineru_model_downloader(adapter_config)
+    if not downloader:
+        return False, "未找到 MinerU 模型下载器 mineru-models-download；请先安装 MinerU 或运行 prepare_mineru_models.ps1"
+    source = clean_text(str(model_config.get("source") or "modelscope"))
+    model_type = clean_text(str(model_config.get("model_type") or "pipeline"))
+    timeout = int(model_config.get("timeout_seconds") or 7200)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stdout_path = output_dir / "mineru-models-download.stdout.log"
+    stderr_path = output_dir / "mineru-models-download.stderr.log"
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    command = [downloader, "-s", source, "-m", model_type]
+    started = datetime.now().isoformat(timespec="seconds")
+    try:
+        with stdout_path.open("a", encoding="utf-8") as stdout_file, stderr_path.open("a", encoding="utf-8") as stderr_file:
+            stdout_file.write(f"\n[{started}] Preparing MinerU models: source={source}, model_type={model_type}\n")
+            stdout_file.flush()
+            result = subprocess.run(
+                command,
+                cwd=str(ROOT),
+                stdout=stdout_file,
+                stderr=stderr_file,
+                text=True,
+                timeout=timeout,
+                env=env,
+                shell=False,
+            )
+    except subprocess.TimeoutExpired:
+        return False, f"MinerU 模型准备超时（>{timeout}s）"
+    except OSError as exc:
+        return False, f"MinerU 模型下载器启动失败：{exc}"
+    if result.returncode != 0:
+        message = read_log_tail(stderr_path, max_chars=2400) or read_log_tail(stdout_path, max_chars=2400)
+        return False, f"MinerU 模型准备失败（退出码 {result.returncode}）：{message or '未返回错误信息'}"
+    return True, None
+
+
+def parse_size_to_mb(value: str, unit: str) -> float:
+    number = float(value)
+    unit = (unit or "").upper()
+    if unit == "K":
+        return number / 1024
+    if unit == "G":
+        return number * 1024
+    if unit == "T":
+        return number * 1024 * 1024
+    return number
+
+
+def strip_ansi(value: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", value or "")
+
+
+def infer_parse_progress(task: ParseTask) -> ParseTask:
+    if task.status not in {"queued", "running"}:
+        return task
+    output_dir = ROOT / CONFIG.get("markdown_dir", "outputs/markdown") / safe_filename(task.paper_id, 120)
+    stderr_text = strip_ansi(read_log_tail(output_dir / "mineru.stderr.log", max_chars=24000))
+    stdout_text = strip_ansi(read_log_tail(output_dir / "mineru.stdout.log", max_chars=4000))
+    model_stdout_text = strip_ansi(read_log_tail(output_dir / "mineru-models-download.stdout.log", max_chars=24000))
+    model_stderr_text = strip_ansi(read_log_tail(output_dir / "mineru-models-download.stderr.log", max_chars=12000))
+    text = "\n".join([stderr_text, stdout_text, model_stdout_text, model_stderr_text])
+    if task.status == "queued":
+        task.progress_percent = task.progress_percent if task.progress_percent is not None else 0
+        task.progress_stage = task.progress_stage or "排队等待"
+        return task
+    task.progress_percent = task.progress_percent if task.progress_percent is not None else 2
+    task.progress_stage = task.progress_stage or "启动 MinerU"
+    download_matches = re.findall(r"([\w.-]+):[^\n\r]*?(\d+(?:\.\d+)?)([KMGT]?)/(\d+(?:\.\d+)?)([KMGT]?)", text, flags=re.IGNORECASE)
+    if download_matches:
+        name, current, current_unit, total, total_unit = download_matches[-1]
+        current_mb = parse_size_to_mb(current, current_unit)
+        total_mb = max(0.001, parse_size_to_mb(total, total_unit))
+        percent = max(0.0, min(100.0, current_mb / total_mb * 100))
+        task.progress_percent = round(percent, 1)
+        task.progress_stage = f"下载模型 {name} {current}{current_unit}/{total}{total_unit} ({percent:.1f}%)"
+        return task
+    if "Preparing MinerU models" in text or "Downloading MinerU models" in text:
+        task.progress_percent = max(float(task.progress_percent or 0), 2)
+        task.progress_stage = "准备 MinerU 模型"
+        return task
+    if "Still waiting to acquire lock" in text:
+        task.progress_percent = max(float(task.progress_percent or 0), 1)
+        task.progress_stage = "等待模型下载锁，已有任务正在下载模型"
+        return task
+    page_matches = re.findall(r"(\d+)\s*/\s*(\d+)\s+pages", text, flags=re.IGNORECASE)
+    if page_matches:
+        done, total = page_matches[-1]
+        total_int = max(1, int(total))
+        percent = int(done) / total_int * 100
+        task.progress_percent = round(percent, 1)
+        task.progress_stage = f"处理页面 {done}/{total}"
+        return task
+    if "DocAnalysis init" in text:
+        task.progress_percent = max(float(task.progress_percent or 0), 8)
+        task.progress_stage = "初始化解析模型"
+    elif "Submitting batch" in text:
+        task.progress_percent = max(float(task.progress_percent or 0), 5)
+        task.progress_stage = "提交 PDF 批次"
+    elif "Started local mineru-api" in text or "Start MinerU FastAPI" in text:
+        task.progress_percent = max(float(task.progress_percent or 0), 3)
+        task.progress_stage = "启动本地 MinerU 服务"
+    return task
+
+
+def refresh_parse_task(task: ParseTask) -> ParseTask:
+    if task.status == "running" and task.worker_pid and not process_is_alive(task.worker_pid):
+        task.status = "failed"
+        task.parse_status = "failed"
+        task.message = "MinerU 解析进程已中断，请重新点击解析PDF"
+        task.progress_percent = None
+        task.progress_stage = None
+        task.completed_at = datetime.now().isoformat(timespec="seconds")
+        records = load_paper_records()
+        record = records.get(task.paper_id)
+        if record:
+            updated = update_record_after_parse(record, "failed", None, task.message)
+            task.record = asdict(updated)
+        save_parse_task(task)
+        release_parse_lock(task.task_id)
+        return task
+    return infer_parse_progress(task)
+
+
+class MinerUAdapter:
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        self.config = config or {}
+
+    def parse(self, record: PaperRecord) -> tuple[str, Path | None, str | None]:
+        pdf_path = resolve_record_pdf_path(record)
+        if not pdf_path:
+            return "failed", None, "PDF 文件不存在或路径无效，请先重新获取 PDF"
+        output_dir = ROOT / CONFIG.get("markdown_dir", "outputs/markdown") / safe_filename(record.paper_id, 120)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        preferred_path = output_dir / f"{safe_filename(record.paper_id, 120)}.md"
+        mode = clean_text(str(self.config.get("mode") or "command")).lower()
+        if mode == "service":
+            return self._parse_with_service(record, pdf_path, output_dir, preferred_path)
+        models_ready, models_message = prepare_mineru_models(self.config, output_dir)
+        if not models_ready:
+            return "failed", None, models_message
+        safe_pdf_path = mineru_safe_pdf_path(record, pdf_path)
+        return self._parse_with_command(record, safe_pdf_path, output_dir, preferred_path)
+
+    def _template_context(self, record: PaperRecord, pdf_path: Path, output_dir: Path, markdown_path: Path) -> dict[str, str]:
+        return {
+            "paper_id": record.paper_id,
+            "pdf_path": str(pdf_path),
+            "output_dir": str(output_dir),
+            "markdown_path": str(markdown_path),
+        }
+
+    def _parse_with_command(self, record: PaperRecord, pdf_path: Path, output_dir: Path, markdown_path: Path) -> tuple[str, Path | None, str | None]:
+        command = clean_text(str(self.config.get("command") or "mineru"))
+        executable = shutil.which(command) or (command if Path(command).exists() else "")
+        if not executable:
+            return "need_review", None, f"未找到 MinerU 命令：{command}。请在 config.json 配置 mineru_adapter.command"
+        raw_args = self.config.get("args") or ["-p", "{pdf_path}", "-o", "{output_dir}"]
+        context = self._template_context(record, pdf_path, output_dir, markdown_path)
+        args = [str(arg).format(**context) for arg in raw_args]
+        timeout = int(self.config.get("timeout_seconds") or 600)
+        stdout_path = output_dir / "mineru.stdout.log"
+        stderr_path = output_dir / "mineru.stderr.log"
+        env = os.environ.copy()
+        runtime_tmp = mineru_runtime_dir(record) / "tmp"
+        runtime_tmp.mkdir(parents=True, exist_ok=True)
+        env["TMP"] = str(runtime_tmp)
+        env["TEMP"] = str(runtime_tmp)
+        env["TMPDIR"] = str(runtime_tmp)
+        env.setdefault("PYTHONUTF8", "1")
+        compat_path = str(ROOT / "mineru_compat")
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = compat_path if not existing_pythonpath else compat_path + os.pathsep + existing_pythonpath
+        fast_lang_model = clean_text(str(self.config.get("fast_langdetect_model_path") or CONFIG.get("fast_langdetect_model_path") or ""))
+        if not fast_lang_model:
+            fast_lang_model = str(Path.home() / ".cache" / "litassis" / "fast_langdetect" / "lid.176.ftz")
+        if Path(fast_lang_model).exists():
+            env["FTLANG_SMALL_MODEL"] = fast_lang_model
+        try:
+            with stdout_path.open("w", encoding="utf-8") as stdout_file, stderr_path.open("w", encoding="utf-8") as stderr_file:
+                result = subprocess.run(
+                    [executable, *args],
+                    cwd=str(ROOT),
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    text=True,
+                    timeout=timeout,
+                    env=env,
+                    shell=False,
+                )
+        except subprocess.TimeoutExpired:
+            return "failed", None, f"MinerU 解析超时（>{timeout}s）"
+        except OSError as exc:
+            return "failed", None, f"MinerU 命令启动失败：{exc}"
+        if result.returncode != 0:
+            message = read_log_tail(stderr_path) or read_log_tail(stdout_path)
+            return "failed", None, f"MinerU 命令退出码 {result.returncode}：{message or '未返回错误信息'}"
+        md_path = find_markdown_output(output_dir, markdown_path)
+        if not md_path:
+            message = read_log_tail(stderr_path) or read_log_tail(stdout_path)
+            return "failed", None, f"MinerU 未生成 Markdown 文件。{message}"
+        review_reason = markdown_needs_review(md_path)
+        return ("need_review" if review_reason else "success"), md_path, review_reason
+
+    def _parse_with_service(self, record: PaperRecord, pdf_path: Path, output_dir: Path, markdown_path: Path) -> tuple[str, Path | None, str | None]:
+        service_url = clean_text(str(self.config.get("service_url") or ""))
+        if not service_url:
+            return "need_review", None, "未配置 MinerU 外部服务地址 mineru_adapter.service_url"
+        payload = {
+            "paper_id": record.paper_id,
+            "title": record.title,
+            "pdf_path": str(pdf_path),
+            "output_dir": str(output_dir),
+            "markdown_path": str(markdown_path),
+        }
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = urllib.request.Request(service_url, data=data, headers={"Content-Type": "application/json; charset=utf-8"})
+        timeout = int(self.config.get("timeout_seconds") or 600)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                result = json.loads(response.read().decode("utf-8", errors="replace"))
+        except urllib.error.HTTPError as exc:
+            return "failed", None, f"MinerU 服务返回 HTTP {exc.code}"
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            return "failed", None, f"MinerU 服务调用失败：{exc}"
+        if not isinstance(result, dict) or result.get("ok") is False:
+            return "failed", None, clean_text(str((result or {}).get("error") or "MinerU 服务未返回成功状态"))
+        if result.get("markdown"):
+            markdown_path.write_text(str(result["markdown"]), encoding="utf-8")
+        elif result.get("markdown_path"):
+            source_path = Path(str(result["markdown_path"]))
+            if source_path.exists():
+                if source_path.resolve() != markdown_path.resolve():
+                    markdown_path.write_text(source_path.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+        md_path = find_markdown_output(output_dir, markdown_path)
+        if not md_path:
+            return "failed", None, "MinerU 服务未生成 Markdown 文件"
+        review_reason = clean_text(str(result.get("review_reason") or "")) or markdown_needs_review(md_path)
+        parse_status = clean_text(str(result.get("parse_status") or "")).lower()
+        if parse_status in {"success", "failed", "need_review"}:
+            return parse_status, md_path if parse_status != "failed" else None, review_reason or clean_text(str(result.get("error") or ""))
+        return ("need_review" if review_reason else "success"), md_path, review_reason
+
+
+def update_record_after_parse(record: PaperRecord, parse_status: str, markdown_path: Path | None, message: str | None) -> PaperRecord:
+    records = load_paper_records()
+    current = records.get(record.paper_id, record)
+    current.parse_status = parse_status
+    current.parse_error = message if parse_status != "success" else None
+    current.parse_time = datetime.now().isoformat(timespec="seconds")
+    current.parser = "mineru_adapter"
+    if markdown_path and parse_status in {"success", "need_review"}:
+        current.markdown_path = relative_path(markdown_path)
+    records[current.paper_id] = current
+    save_paper_records(records)
+    return current
+
+
+def mark_record_parse_running(record: PaperRecord, task: ParseTask) -> PaperRecord:
+    records = load_paper_records()
+    current = records.get(record.paper_id, record)
+    current.parse_status = task.parse_status
+    current.parse_error = task.message
+    current.parse_time = datetime.now().isoformat(timespec="seconds")
+    current.parser = "mineru_adapter"
+    records[current.paper_id] = current
+    save_paper_records(records)
+    return current
+
+
+def run_parse_task(task_id: str) -> int:
+    task = load_parse_task(task_id)
+    if not task:
+        return 1
+    records = load_paper_records()
+    record = records.get(task.paper_id)
+    if not record:
+        task.status = "failed"
+        task.parse_status = "failed"
+        task.message = "未找到论文获取记录"
+        task.completed_at = datetime.now().isoformat(timespec="seconds")
+        save_parse_task(task)
+        return 1
+    if not acquire_parse_lock(task):
+        return 1
+    task.status = "running"
+    task.parse_status = "running"
+    task.started_at = datetime.now().isoformat(timespec="seconds")
+    task.message = "MinerU 解析中"
+    task.progress_percent = 1
+    task.progress_stage = "准备 MinerU 模型"
+    record = mark_record_parse_running(record, task)
+    task.record = asdict(record)
+    save_parse_task(task)
+    try:
+        parse_status, markdown_path, message = MinerUAdapter(CONFIG.get("mineru_adapter", {})).parse(record)
+        updated = update_record_after_parse(record, parse_status, markdown_path, message)
+        task.parse_status = parse_status
+        task.status = "success" if parse_status == "success" else parse_status
+        task.markdown_path = updated.markdown_path
+        task.message = message or ("解析成功" if parse_status == "success" else "解析完成，需人工复核")
+        task.record = asdict(updated)
+        task.progress_percent = 100 if parse_status in {"success", "need_review"} else task.progress_percent
+        task.progress_stage = "解析完成" if parse_status in {"success", "need_review"} else "解析失败"
+        task.completed_at = datetime.now().isoformat(timespec="seconds")
+        save_parse_task(task)
+        log_event("paper parse task completed", {"task_id": task_id, "paper_id": record.paper_id, "parse_status": parse_status, "message": task.message})
+        return 0 if parse_status in {"success", "need_review"} else 1
+    finally:
+        release_parse_lock(task_id)
+
+
+def start_parse_task_for_record(record: PaperRecord) -> ParseTask:
+    ensure_dirs()
+    active_task = latest_parse_task_for_paper(record.paper_id, {"queued", "running"})
+    if active_task:
+        updated_record = mark_record_parse_running(record, active_task)
+        active_task.record = asdict(updated_record)
+        save_parse_task(active_task)
+        return active_task
+    existing_md = resolve_record_markdown_path(record)
+    if record.parse_status == "success" and existing_md:
+        task = ParseTask(
+            task_id="task_" + uuid.uuid4().hex[:18],
+            paper_id=record.paper_id,
+            status="success",
+            completed_at=datetime.now().isoformat(timespec="seconds"),
+            message="Markdown 已存在，复用解析结果",
+            markdown_path=record.markdown_path,
+            parse_status="success",
+            record=asdict(record),
+        )
+        save_parse_task(task)
+        return task
+    task = ParseTask(
+        task_id="task_" + uuid.uuid4().hex[:18],
+        paper_id=record.paper_id,
+        status="queued",
+        message="MinerU 解析任务已排队",
+        parse_status="queued",
+        progress_percent=0,
+        progress_stage="排队等待",
+    )
+    if record.fetch_status != "success" or not resolve_record_pdf_path(record):
+        task.status = "failed"
+        task.parse_status = "failed"
+        task.message = "PDF 不存在，无法解析；请先成功获取 PDF"
+        task.completed_at = datetime.now().isoformat(timespec="seconds")
+        updated = update_record_after_parse(record, "failed", None, task.message)
+        task.record = asdict(updated)
+        save_parse_task(task)
+        return task
+    updated_record = mark_record_parse_running(record, task)
+    task.record = asdict(updated_record)
+    save_parse_task(task)
+    command = [sys.executable, str(Path(__file__).resolve()), "--run-parse-task", task.task_id]
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" and hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+    try:
+        process = subprocess.Popen(
+            command,
+            cwd=str(ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=creationflags,
+        )
+        task.worker_pid = process.pid
+        save_parse_task(task)
+    except OSError as exc:
+        task.status = "failed"
+        task.parse_status = "failed"
+        task.message = f"解析子进程启动失败：{exc}"
+        task.completed_at = datetime.now().isoformat(timespec="seconds")
+        updated = update_record_after_parse(record, "failed", None, task.message)
+        task.record = asdict(updated)
+        save_parse_task(task)
+    return task
+
+
 def deepseek_single_paper_analysis(topic: str, paper: Paper) -> dict[str, Any]:
     fallback = {
         "ok": True,
@@ -2256,6 +2904,48 @@ class LiteratureAssistantHandler(SimpleHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif path == "/api/paper/parse-task":
+                task_id = clean_text(str(query.get("task_id", [""])[0] or ""))
+                if task_id:
+                    task = load_parse_task(task_id)
+                    if task:
+                        task = refresh_parse_task(task)
+                    json_response(self, asdict(task) if task else {"ok": False, "error": "parse task not found"}, HTTPStatus.OK if task else HTTPStatus.NOT_FOUND)
+                else:
+                    paper_id = clean_text(str(query.get("paper_id", [""])[0] or ""))
+                    if not paper_id:
+                        json_response(self, {"ok": False, "error": "missing task_id or paper_id"}, HTTPStatus.BAD_REQUEST)
+                        return
+                    tasks = []
+                    for task_file in parse_tasks_dir().glob("*.json"):
+                        try:
+                            task_data = json.loads(task_file.read_text(encoding="utf-8"))
+                        except json.JSONDecodeError:
+                            continue
+                        if task_data.get("paper_id") == paper_id:
+                            task = load_parse_task(str(task_data.get("task_id") or ""))
+                            if task:
+                                task_data = asdict(refresh_parse_task(task))
+                            tasks.append(task_data)
+                    tasks.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
+                    json_response(self, {"items": tasks})
+            elif path == "/api/paper/markdown":
+                paper_id = clean_text(str(query.get("paper_id", [""])[0] or query.get("id", [""])[0] or ""))
+                record = load_paper_records().get(paper_id)
+                if not record:
+                    json_response(self, {"ok": False, "error": "paper record not found"}, HTTPStatus.NOT_FOUND)
+                    return
+                md_path = resolve_record_markdown_path(record)
+                if not md_path:
+                    json_response(self, {"ok": False, "error": "Markdown not found or parse not successful"}, HTTPStatus.NOT_FOUND)
+                    return
+                body = md_path.read_text(encoding="utf-8", errors="replace").encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/markdown; charset=utf-8")
+                self.send_header("Content-Disposition", f'inline; filename="{md_path.name}"')
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             elif path == "/api/hotspots":
                 output_path = ROOT / CONFIG["output_file"]
                 if output_path.exists():
@@ -2321,6 +3011,24 @@ class LiteratureAssistantHandler(SimpleHTTPRequestHandler):
                     if record.fetch_status == "no_open_fulltext":
                         status = HTTPStatus.NOT_FOUND
                     json_response(self, {"ok": record.fetch_status == "success", "record": asdict(record)}, status)
+            elif parsed.path == "/api/paper/parse":
+                if not require_api_password(self, payload=payload):
+                    return
+                records = load_paper_records()
+                paper_id = clean_text(str(payload.get("paper_id") or payload.get("id") or ""))
+                paper_payload = payload.get("paper") if isinstance(payload.get("paper"), dict) else payload
+                if not paper_id and isinstance(paper_payload, dict):
+                    paper = paper_from_payload(paper_payload)
+                    paper_id = paper_id_for(paper, paper_payload)
+                record = records.get(paper_id)
+                if not record:
+                    json_response(self, {"ok": False, "error": "paper PDF record not found; fetch PDF first"}, HTTPStatus.NOT_FOUND)
+                    return
+                task = start_parse_task_for_record(record)
+                status = HTTPStatus.ACCEPTED if task.status in {"queued", "running"} else HTTPStatus.OK
+                if task.status == "failed":
+                    status = HTTPStatus.BAD_REQUEST
+                json_response(self, {"ok": task.status not in {"failed"}, "task": asdict(task), "record": task.record}, status)
             elif parsed.path == "/api/deepseek/config":
                 if not require_api_password(self, payload=payload):
                     return
@@ -2360,8 +3068,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="文献助手本地服务")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5179)
+    parser.add_argument("--run-parse-task", help="运行一个文件型 PDF 转 Markdown 解析任务后退出")
     args = parser.parse_args()
     ensure_dirs()
+    if args.run_parse_task:
+        raise SystemExit(run_parse_task(args.run_parse_task))
     server = ThreadingHTTPServer((args.host, args.port), LiteratureAssistantHandler)
     print(f"文献助手已启动: http://{args.host}:{args.port}/index.html")
     try:

@@ -646,8 +646,14 @@ progress::-webkit-progress-value {
   align-items: center;
 }
 
-.paper-fetch-status {
+.paper-status-row {
   margin-top: 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.paper-fetch-status {
   display: inline-flex;
   width: fit-content;
   border: 1px solid var(--line);
@@ -677,8 +683,25 @@ progress::-webkit-progress-value {
   color: #a83434;
 }
 
+.parse-progress {
+  margin-top: 10px;
+  display: grid;
+  gap: 5px;
+}
+
+.parse-progress progress {
+  height: 7px;
+}
+
+.parse-progress span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .inline-analysis-button,
 .fetch-pdf-button,
+.parse-pdf-button,
+.preview-markdown-button,
 .open-pdf-link {
   margin-top: 10px;
   border: 1px solid var(--line);
@@ -697,17 +720,22 @@ progress::-webkit-progress-value {
 
 .paper-actions .inline-analysis-button,
 .paper-actions .fetch-pdf-button,
+.paper-actions .parse-pdf-button,
+.paper-actions .preview-markdown-button,
 .paper-actions .open-pdf-link {
   margin-top: 0;
 }
 
-.fetch-pdf-button:disabled {
+.fetch-pdf-button:disabled,
+.parse-pdf-button:disabled {
   cursor: wait;
   opacity: 0.65;
 }
 
 .inline-analysis-button svg,
 .fetch-pdf-button svg,
+.parse-pdf-button svg,
+.preview-markdown-button svg,
 .open-pdf-link svg {
   width: 14px;
   height: 14px;
@@ -890,6 +918,25 @@ pre {
   padding-left: 20px;
   color: var(--ink);
   line-height: 1.6;
+}
+
+.markdown-preview-panel {
+  width: min(1080px, calc(100vw - 48px));
+}
+
+#markdownPreviewBody {
+  margin: 0;
+  max-height: 72vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fafb;
+  color: #1f2a37;
+  padding: 14px;
+  line-height: 1.55;
+  font-size: 13px;
 }
 
 .form-grid {

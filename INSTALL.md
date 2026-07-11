@@ -11,9 +11,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_literature_assistan
 脚本会：
 
 1. 检查 Python。
-2. 启动本地服务。
-3. 等待 `/api/status` 可用。
-4. 打开浏览器访问页面。
+2. 预下载 MinerU `pipeline` 模型。
+3. 启动本地服务。
+4. 等待 `/api/status` 可用。
+5. 打开浏览器访问页面。
 
 访问地址：
 
@@ -91,7 +92,27 @@ DEEPSEEK_MODEL=deepseek-chat
 
 配置变更后建议重启服务。
 
-## 6. 验证
+## 6. MinerU PDF 解析模型
+
+解析 PDF 前，后端会自动运行：
+
+```powershell
+.\.mineru-venv\Scripts\mineru-models-download.exe -s modelscope -m pipeline
+```
+
+也可以手动预下载：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\prepare_mineru_models.ps1
+```
+
+下载日志在：
+
+```text
+logs/mineru-models-download.out.log
+```
+
+## 7. 验证
 
 ```bash
 curl http://127.0.0.1:5179/api/status
@@ -106,7 +127,7 @@ curl http://127.0.0.1:5179/api/status
 }
 ```
 
-## 7. 常见问题
+## 8. 常见问题
 
 ### Python 未找到
 

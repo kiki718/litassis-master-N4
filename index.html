@@ -339,6 +339,21 @@
       </section>
     </div>
 
+    <div class="modal-backdrop" id="markdownPreviewModal" hidden>
+      <section class="modal-panel markdown-preview-panel" role="dialog" aria-modal="true" aria-labelledby="markdownPreviewTitle">
+        <div class="panel-head">
+          <div>
+            <h2 id="markdownPreviewTitle">Markdown 预览</h2>
+            <span id="markdownPreviewMeta">等待解析结果</span>
+          </div>
+          <button class="icon-button small" id="closeMarkdownPreview" title="关闭">
+            <i data-lucide="x"></i>
+          </button>
+        </div>
+        <pre id="markdownPreviewBody">选择已解析的文献后，这里会显示 MinerU 生成的 Markdown。</pre>
+      </section>
+    </div>
+
     <script src="app.js"></script>
   </body>
 </html>

@@ -28,6 +28,15 @@ if (-not $Existing) {
     New-Item -ItemType Directory -Path $LogDir | Out-Null
   }
 
+  $PrepareModels = Join-Path $ProjectDir "prepare_mineru_models.ps1"
+  if (Test-Path $PrepareModels) {
+    & $PrepareModels -Source modelscope -ModelType pipeline
+    if ($LASTEXITCODE -ne 0) {
+      Add-Type -AssemblyName PresentationFramework
+      [System.Windows.MessageBox]::Show("MinerU models were not prepared successfully. PDF parsing may fail until models finish downloading. Please check logs\mineru-models-download.out.log.", "Literature Assistant", "OK", "Warning") | Out-Null
+    }
+  }
+
   $OutLog = Join-Path $LogDir "desktop-launch.out.log"
   $ErrLog = Join-Path $LogDir "desktop-launch.err.log"
 

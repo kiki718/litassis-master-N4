@@ -34,6 +34,12 @@ Windows 一键启动：
 powershell -NoProfile -ExecutionPolicy Bypass -File .\launch_literature_assistant.ps1
 ```
 
+首次使用 MinerU 解析 PDF 前，启动脚本会自动预下载 `pipeline` 模型。也可以手动执行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\prepare_mineru_models.ps1
+```
+
 Linux/macOS：
 
 ```bash
