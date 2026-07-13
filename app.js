@@ -53,6 +53,7 @@ let papers = [
 let topicSummary = null;
 let currentTopic = "分布式光干涉";
 let paperRecords = new Map();
+let scienceRecords = new Map();
 let parseTasks = new Map();
 let activeParsePolls = new Set();
 
@@ -293,6 +294,16 @@ function mergePaperRecord(record) {
   }
 }
 
+function mergeScienceRecord(record) {
+  if (!record?.paper_id) return;
+  scienceRecords.set(record.paper_id, record);
+  papers.forEach((paper) => {
+    if (paper.paper_id === record.paper_id || paper.paper_record?.paper_id === record.paper_id) {
+      paper.science_record = record;
+    }
+  });
+}
+
 function refreshPaperViews() {
   renderPapers(document.querySelector("#paperSearch")?.value || "");
   renderSummaries();
@@ -315,6 +326,7 @@ function renderPaperItem(paper) {
     ? `/api/paper/pdf?paper_id=${encodeURIComponent(record.paper_id)}`
     : "";
   const canPreviewMarkdown = record?.paper_id && record?.markdown_path && ["success", "need_review"].includes(record?.parse_status);
+  const canExtractScience = record?.paper_id && (canPreviewMarkdown || paper.science_record || scienceRecords.has(record.paper_id));
   return `
     <article class="paper-item" data-paper-index="${paperIndex}">
       <strong>${escapeHtml(paper.title)}</strong>
@@ -339,6 +351,7 @@ function renderPaperItem(paper) {
           <span>${record?.parse_status === "success" ? "重新解析" : "解析PDF"}</span>
         </button>
         ${canPreviewMarkdown ? `<button class="preview-markdown-button" data-paper-id="${escapeHtml(record.paper_id)}" type="button"><i data-lucide="book-open-text"></i><span>预览Markdown</span></button>` : ""}
+        ${canExtractScience ? `<button class="science-info-button" data-paper-index="${paperIndex}" data-paper-id="${escapeHtml(record.paper_id)}" type="button"><i data-lucide="microscope"></i><span>科学信息</span></button>` : ""}
       </div>
     </article>
   `;
@@ -555,7 +568,9 @@ function normalizeHotspots(items) {
   );
   papers.forEach((paper) => {
     if (paper.paper_record) mergePaperRecord(paper.paper_record);
+    if (paper.science_record) mergeScienceRecord(paper.science_record);
     if (paper.paper_id && paperRecords.has(paper.paper_id)) paper.paper_record = paperRecords.get(paper.paper_id);
+    if (paper.paper_id && scienceRecords.has(paper.paper_id)) paper.science_record = scienceRecords.get(paper.paper_id);
   });
 }
 
@@ -756,6 +771,116 @@ function closeMarkdownPreview() {
   if (modal) modal.hidden = true;
 }
 
+function evidenceByIndex(record, index) {
+  const value = Number(index);
+  if (!Number.isInteger(value)) return null;
+  return record?.evidence?.[value] || null;
+}
+
+function renderEvidenceRefs(record, refs = []) {
+  const seen = new Set();
+  const uniqueRefs = [];
+  for (const refIndex of refs || []) {
+    const ref = evidenceByIndex(record, refIndex);
+    if (!ref) continue;
+    const key = `${ref.section || ""}\n${String(ref.quote || "").replace(/\s+/g, " ").trim()}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    uniqueRefs.push(ref);
+  }
+  return uniqueRefs
+    .map((ref) => `
+      <blockquote>
+        <strong>${escapeHtml(ref.section || "全文")}</strong>
+        <span>${escapeHtml(ref.quote || "")}</span>
+      </blockquote>
+    `)
+    .join("");
+}
+
+function renderScienceRecord(record) {
+  if (!record) return "<p>暂无科学信息抽取结果。</p>";
+  const targets = record.targets || [];
+  const methods = record.methods || [];
+  const parameters = record.parameters || [];
+  const conclusions = record.conclusions || [];
+  return `
+    <div class="science-meta">来源：${record.source === "markdown" ? "MinerU Markdown 全文" : "题名与摘要回退"} · ${escapeHtml(record.updated_at || "")}</div>
+    <section class="science-section">
+      <h3>研究对象与别名</h3>
+      ${targets.length ? targets.map((item) => `
+        <article>
+          <strong>${escapeHtml(item.name || "-")}</strong>
+          <span>${escapeHtml((item.aliases || []).join("、") || "未识别别名")}</span>
+          ${renderEvidenceRefs(record, item.evidence_refs)}
+        </article>
+      `).join("") : "<p>未识别到明确研究对象。</p>"}
+    </section>
+    <section class="science-section">
+      <h3>观测方法或仪器</h3>
+      ${methods.length ? methods.map((item) => `
+        <article>
+          <strong>${escapeHtml(item.name || "-")}</strong>
+          <span>${escapeHtml((item.keywords || []).join("、"))}</span>
+          ${renderEvidenceRefs(record, item.evidence_refs)}
+        </article>
+      `).join("") : "<p>未识别到方法或仪器。</p>"}
+    </section>
+    <section class="science-section">
+      <h3>白名单物理参数</h3>
+      <div class="parameter-grid">
+        ${parameters.map((item) => `
+          <div class="parameter-cell ${item.value ? "" : "empty"}">
+            <strong>${escapeHtml(item.name || "-")}</strong>
+            <span>${item.value ? `${escapeHtml(item.value)} ${escapeHtml(item.unit || "")}` : "未出现"}</span>
+            ${renderEvidenceRefs(record, item.evidence_refs)}
+          </div>
+        `).join("")}
+      </div>
+    </section>
+    <section class="science-section">
+      <h3>结论片段</h3>
+      ${conclusions.length ? conclusions.map((item) => `
+        <article>
+          <p>${escapeHtml(item.text || "")}</p>
+          ${renderEvidenceRefs(record, item.evidence_refs)}
+        </article>
+      `).join("") : "<p>未识别到明确结论句。</p>"}
+    </section>
+  `;
+}
+
+async function openScienceInfoModal(paper, paperId) {
+  const modal = document.querySelector("#scienceInfoModal");
+  const body = document.querySelector("#scienceInfoBody");
+  const meta = document.querySelector("#scienceInfoMeta");
+  if (!modal || !body || !paperId) return;
+  modal.hidden = false;
+  document.querySelector("#scienceInfoTitle").textContent = paper?.title || "科学信息抽取";
+  meta.textContent = "正在从全文抽取轻量科学信息...";
+  body.innerHTML = "";
+  try {
+    const response = await fetch("/api/paper/extract-science", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paper_id: paperId, paper })
+    });
+    const payload = await response.json();
+    if (!response.ok || !payload.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    mergeScienceRecord(payload.record);
+    meta.textContent = payload.record?.source === "markdown" ? "优先使用 MinerU Markdown 全文" : "未找到全文，使用题名与摘要回退";
+    body.innerHTML = renderScienceRecord(payload.record);
+  } catch (error) {
+    meta.textContent = "抽取失败";
+    body.innerHTML = `<p>科学信息抽取失败：${escapeHtml(error.message)}</p>`;
+  }
+}
+
+function closeScienceInfoModal() {
+  const modal = document.querySelector("#scienceInfoModal");
+  if (modal) modal.hidden = true;
+}
+
 function resetAnalysisState(topic = "") {
   currentTopic = topic || currentTopic;
   hotspots = [];
@@ -863,7 +988,9 @@ document.querySelector("#simulateRun").addEventListener("click", async () => {
     }));
     papers.forEach((paper) => {
       if (paper.paper_record) mergePaperRecord(paper.paper_record);
+      if (paper.science_record) mergeScienceRecord(paper.science_record);
       if (paper.paper_id && paperRecords.has(paper.paper_id)) paper.paper_record = paperRecords.get(paper.paper_id);
+      if (paper.paper_id && scienceRecords.has(paper.paper_id)) paper.science_record = scienceRecords.get(paper.paper_id);
     });
     renderTopicSummary(payload.topic || topic, topicSummary);
     const now = new Date().toLocaleTimeString("zh-CN", { hour12: false });
@@ -917,6 +1044,14 @@ document.addEventListener("click", (event) => {
   const button = event.target.closest(".preview-markdown-button");
   if (!button?.dataset.paperId) return;
   openMarkdownPreview(button.dataset.paperId);
+});
+
+document.addEventListener("click", (event) => {
+  const button = event.target.closest(".science-info-button");
+  if (!button?.dataset.paperId) return;
+  const index = Number(button.dataset.paperIndex);
+  const paper = Number.isInteger(index) ? papers[index] : null;
+  openScienceInfoModal(paper, button.dataset.paperId);
 });
 document.querySelector("#timeframeSelect").addEventListener("change", () => {
   updateCustomMonthsVisibility();
@@ -1002,6 +1137,10 @@ document.querySelector("#paperAnalysisModal").addEventListener("click", (event) 
 document.querySelector("#closeMarkdownPreview").addEventListener("click", closeMarkdownPreview);
 document.querySelector("#markdownPreviewModal").addEventListener("click", (event) => {
   if (event.target.id === "markdownPreviewModal") closeMarkdownPreview();
+});
+document.querySelector("#closeScienceInfo").addEventListener("click", closeScienceInfoModal);
+document.querySelector("#scienceInfoModal").addEventListener("click", (event) => {
+  if (event.target.id === "scienceInfoModal") closeScienceInfoModal();
 });
 
 renderAll();

@@ -702,6 +702,7 @@ progress::-webkit-progress-value {
 .fetch-pdf-button,
 .parse-pdf-button,
 .preview-markdown-button,
+.science-info-button,
 .open-pdf-link {
   margin-top: 10px;
   border: 1px solid var(--line);
@@ -722,6 +723,7 @@ progress::-webkit-progress-value {
 .paper-actions .fetch-pdf-button,
 .paper-actions .parse-pdf-button,
 .paper-actions .preview-markdown-button,
+.paper-actions .science-info-button,
 .paper-actions .open-pdf-link {
   margin-top: 0;
 }
@@ -736,6 +738,7 @@ progress::-webkit-progress-value {
 .fetch-pdf-button svg,
 .parse-pdf-button svg,
 .preview-markdown-button svg,
+.science-info-button svg,
 .open-pdf-link svg {
   width: 14px;
   height: 14px;
@@ -937,6 +940,81 @@ pre {
   padding: 14px;
   line-height: 1.55;
   font-size: 13px;
+}
+
+.science-info-panel {
+  width: min(980px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+}
+
+.science-info-content {
+  display: grid;
+  gap: 14px;
+}
+
+.science-meta {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fafb;
+  padding: 10px 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.science-section {
+  display: grid;
+  gap: 10px;
+}
+
+.science-section h3 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.science-section article,
+.parameter-cell {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  background: #ffffff;
+  display: grid;
+  gap: 7px;
+}
+
+.science-section article span,
+.parameter-cell span {
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.parameter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+}
+
+.parameter-cell.empty {
+  background: #f8fafb;
+}
+
+.science-section blockquote,
+.parameter-cell blockquote {
+  margin: 0;
+  border-left: 3px solid #2f80ed;
+  padding: 8px 10px;
+  background: #f8fafb;
+  color: var(--ink);
+  display: grid;
+  gap: 4px;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.science-section blockquote strong,
+.parameter-cell blockquote strong {
+  color: #2f5f93;
 }
 
 .form-grid {

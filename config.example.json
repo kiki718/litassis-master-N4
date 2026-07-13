@@ -4,6 +4,7 @@
   "hotspots_file": "test_hotspots.json",
   "output_file": "outputs/hotspots.json",
   "paper_records_file": "outputs/paper_records.json",
+  "science_records_file": "outputs/science_records.json",
   "pdf_dir": "outputs/pdfs",
   "markdown_dir": "outputs/markdown",
   "parse_tasks_dir": "outputs/parse_tasks",
@@ -35,6 +36,7 @@
   "deepseek_paper_summary_enabled": false,
   "paper_summary_batch_size": 8,
   "paper_summary_abstract_chars": 1800,
+  "science_markdown_max_chars": 120000,
   "overall_analysis_abstract_chars": 900,
   "overall_analysis_max_papers": 220,
   "literature_corpus_file": "outputs/literature_corpus.md"

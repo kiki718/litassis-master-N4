@@ -38,6 +38,7 @@ DEFAULT_CONFIG = {
     "output_file": "outputs/hotspots.json",
     "literature_corpus_file": "outputs/literature_corpus.md",
     "paper_records_file": "outputs/paper_records.json",
+    "science_records_file": "outputs/science_records.json",
     "pdf_dir": "outputs/pdfs",
     "markdown_dir": "outputs/markdown",
     "parse_tasks_dir": "outputs/parse_tasks",
@@ -70,6 +71,7 @@ DEFAULT_CONFIG = {
     "deepseek_paper_summary_enabled": False,
     "paper_summary_batch_size": 8,
     "paper_summary_abstract_chars": 1800,
+    "science_markdown_max_chars": 120000,
     "overall_analysis_abstract_chars": 900,
     "overall_analysis_max_papers": 220,
 }
@@ -136,6 +138,30 @@ class ParseTask:
     progress_stage: str | None = None
     worker_pid: int | None = None
     record: dict[str, Any] | None = None
+
+
+@dataclass
+class EvidenceRef:
+    paper_id: str
+    section: str
+    quote: str
+    page: str | None = None
+
+
+SCIENCE_EXTRACTOR_VERSION = "n3-light-v2"
+
+
+@dataclass
+class ScienceRecord:
+    paper_id: str
+    source: str = "abstract"
+    extractor_version: str = SCIENCE_EXTRACTOR_VERSION
+    updated_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
+    targets: list[dict[str, Any]] = field(default_factory=list)
+    methods: list[dict[str, Any]] = field(default_factory=list)
+    parameters: list[dict[str, Any]] = field(default_factory=list)
+    conclusions: list[dict[str, Any]] = field(default_factory=list)
+    evidence: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -220,8 +246,11 @@ def log_event(message: str, data: dict[str, Any] | None = None) -> None:
         "message": message,
         "data": data or {},
     }
-    with (ROOT / "logs" / "run.log").open("a", encoding="utf-8") as file:
-        file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    try:
+        with (ROOT / "logs" / "run.log").open("a", encoding="utf-8") as file:
+            file.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    except OSError:
+        return
 
 
 def read_csv_rows(path: Path) -> list[dict[str, str]]:
@@ -303,6 +332,16 @@ def read_cache(prefix: str, key: str, max_age_hours: int = 24 * 14) -> Any | Non
 def write_cache(prefix: str, key: str, value: Any) -> None:
     ensure_dirs()
     cache_path(prefix, key).write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def try_write_text(path: Path, text: str, encoding: str = "utf-8") -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding=encoding)
+        return True
+    except OSError as exc:
+        log_event("文件写入失败", {"path": str(path), "error": str(exc)})
+        return False
 
 
 def build_search_terms(target: Target) -> list[str]:
@@ -1368,6 +1407,45 @@ def save_paper_records(records: dict[str, PaperRecord]) -> None:
     paper_records_path().write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def science_records_path() -> Path:
+    return ROOT / CONFIG.get("science_records_file", "outputs/science_records.json")
+
+
+def load_science_records() -> dict[str, ScienceRecord]:
+    path = science_records_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    items = data if isinstance(data, list) else list(data.values()) if isinstance(data, dict) else []
+    records: dict[str, ScienceRecord] = {}
+    for item in items:
+        if not isinstance(item, dict) or not item.get("paper_id"):
+            continue
+        try:
+            records[str(item["paper_id"])] = ScienceRecord(**item)
+        except TypeError:
+            allowed = {field.name for field in ScienceRecord.__dataclass_fields__.values()}
+            records[str(item["paper_id"])] = ScienceRecord(**{key: value for key, value in item.items() if key in allowed})
+    return records
+
+
+def save_science_records(records: dict[str, ScienceRecord]) -> None:
+    ensure_dirs()
+    payload = [asdict(record) for record in sorted(records.values(), key=lambda item: item.paper_id)]
+    science_records_path().write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def save_science_record(record: ScienceRecord) -> ScienceRecord:
+    records = load_science_records()
+    record.updated_at = datetime.now().isoformat(timespec="seconds")
+    records[record.paper_id] = record
+    save_science_records(records)
+    return record
+
+
 def extract_arxiv_id(value: str) -> tuple[str | None, str | None]:
     value = clean_text(value)
     if not value:
@@ -1721,6 +1799,280 @@ def resolve_record_markdown_path(record: PaperRecord) -> Path | None:
     except ValueError:
         return None
     return md_path if md_path.exists() else None
+
+
+def paper_record_for_paper(paper: Paper) -> PaperRecord | None:
+    return load_paper_records().get(paper_id_for(paper))
+
+
+def paper_text_source(paper: Paper, max_chars: int | None = None) -> tuple[str, str, str | None]:
+    record = paper_record_for_paper(paper)
+    max_chars = max_chars or int(CONFIG.get("science_markdown_max_chars", 120000))
+    if record and record.parse_status in {"success", "need_review"}:
+        md_path = resolve_record_markdown_path(record)
+        if md_path:
+            text = md_path.read_text(encoding="utf-8", errors="replace")
+            return text[:max_chars], "markdown", record.paper_id
+    fallback = "\n\n".join([paper.title, paper.abstract])
+    return fallback[:max_chars], "abstract", paper_id_for(paper)
+
+
+def markdown_sections(text: str) -> list[dict[str, str]]:
+    sections: list[dict[str, str]] = []
+    current_title = "全文"
+    current_lines: list[str] = []
+    for line in (text or "").splitlines():
+        heading = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
+        if heading:
+            content = "\n".join(current_lines).strip()
+            if content:
+                sections.append({"section": current_title, "text": content})
+            current_title = clean_text(re.sub(r"#+$", "", heading.group(1)))
+            current_lines = []
+        else:
+            current_lines.append(line)
+    content = "\n".join(current_lines).strip()
+    if content:
+        sections.append({"section": current_title, "text": content})
+    if not sections and text.strip():
+        sections.append({"section": "全文", "text": text.strip()})
+    return sections
+
+
+def split_evidence_sentences(text: str) -> list[str]:
+    cleaned = re.sub(r"\s+", " ", text or " ").strip()
+    if not cleaned:
+        return []
+    pieces = re.split(r"(?<=[.!?。！？])\s+", cleaned)
+    return [piece.strip() for piece in pieces if len(piece.strip()) >= 20]
+
+
+def evidence_ref(paper_id: str, section: str, quote: str) -> dict[str, Any]:
+    return asdict(EvidenceRef(paper_id=paper_id, section=section or "全文", quote=quote[:600], page=None))
+
+
+def add_science_evidence(record: ScienceRecord, kind: str, label: str, section: str, quote: str) -> int:
+    ref = evidence_ref(record.paper_id, section, quote)
+    ref["kind"] = kind
+    ref["label"] = label
+    key = (
+        str(ref.get("kind") or "").lower(),
+        str(ref.get("label") or "").lower(),
+        str(ref.get("section") or "").lower(),
+        re.sub(r"\s+", " ", str(ref.get("quote") or "")).strip().lower(),
+    )
+    for index, existing in enumerate(record.evidence):
+        existing_key = (
+            str(existing.get("kind") or "").lower(),
+            str(existing.get("label") or "").lower(),
+            str(existing.get("section") or "").lower(),
+            re.sub(r"\s+", " ", str(existing.get("quote") or "")).strip().lower(),
+        )
+        if existing_key == key:
+            return index
+    record.evidence.append(ref)
+    return len(record.evidence) - 1
+
+
+def entity_term_pattern(value: str) -> str | None:
+    value = re.sub(r"\s+", " ", value or "").strip()
+    if not value:
+        return None
+    parts = [part for part in re.split(r"\s+", value) if part]
+    escaped = r"[\s-]+".join(re.escape(part) for part in parts)
+    return rf"(?<![A-Za-z0-9]){escaped}(?![A-Za-z0-9])"
+
+
+def entity_term_matches(text: str, value: str) -> list[re.Match[str]]:
+    pattern = entity_term_pattern(value)
+    if not pattern:
+        return []
+    return list(re.finditer(pattern, text or "", flags=re.IGNORECASE))
+
+
+def append_unique_ref(item: dict[str, Any], ref_index: int) -> None:
+    refs = item.setdefault("evidence_refs", [])
+    if ref_index not in refs and len(refs) < 3:
+        refs.append(ref_index)
+
+
+def extract_target_mentions_from_text(paper_id: str, text: str, sections: list[dict[str, str]], record: ScienceRecord) -> list[dict[str, Any]]:
+    patterns = [
+        r"\bTIC\s*\d+\b",
+        r"\bTOI[-\s]?\d+(?:\.\d+)?[a-z]?\b",
+        r"\bHD\s*\d+[A-Z]?\b",
+        r"\bHIP\s*\d+\b",
+        r"\bGJ\s*\d+[A-Za-z]?\b",
+        r"\bGliese\s*\d+[A-Za-z]?\b",
+        r"\bK2[-\s]?\d+[A-Za-z]?\b",
+        r"\bKepler[-\s]?\d+[a-z]?\b",
+        r"\bTRAPPIST[-\s]?1[a-z]?\b",
+        r"\bProxima\s+Centauri\b",
+        r"\bAlpha\s+Centauri\b",
+        r"\bTau\s+Ceti\b",
+        r"\bProcyon\b",
+        r"\bLHS\s*\d+\b",
+        r"\bWolf\s*\d+\b",
+    ]
+    alias_lookup: list[tuple[str, Target]] = []
+    seen_aliases: set[tuple[str, str]] = set()
+    for target in load_targets():
+        for alias in [target.name or "", f"TIC {target.id}", *target.aliases]:
+            alias = alias.strip()
+            alias_key = (target.id, alias.lower())
+            if len(alias) >= 4 and alias_key not in seen_aliases:
+                seen_aliases.add(alias_key)
+                alias_lookup.append((alias, target))
+    found: dict[str, dict[str, Any]] = {}
+    for section in sections:
+        section_text = section["text"]
+        sentences = split_evidence_sentences(section_text)
+        for pattern in patterns:
+            for match in re.finditer(pattern, section_text, flags=re.IGNORECASE):
+                raw = re.sub(r"\s+", " ", match.group(0)).strip()
+                name = normalize_stellar_target_name(raw)
+                key = name.lower()
+                quote = next((sentence for sentence in sentences if raw.lower() in sentence.lower()), clean_text(section_text)[:300])
+                item = found.setdefault(key, {"name": name, "aliases": [], "mention_count": 0, "evidence_refs": []})
+                if raw not in item["aliases"]:
+                    item["aliases"].append(raw)
+                item["mention_count"] += 1
+                append_unique_ref(item, add_science_evidence(record, "target", name, section["section"], quote))
+        for alias, target in alias_lookup:
+            matches = entity_term_matches(section_text, alias)
+            if not matches:
+                continue
+            key = (target.name or alias).lower()
+            quote = next((sentence for sentence in sentences if entity_term_matches(sentence, alias)), clean_text(section_text)[:300])
+            item = found.setdefault(
+                key,
+                {
+                    "name": target.name or alias,
+                    "aliases": [],
+                    "catalog_id": target.id,
+                    "mention_count": 0,
+                    "evidence_refs": [],
+                },
+            )
+            item["catalog_id"] = target.id
+            if alias not in item["aliases"]:
+                item["aliases"].append(alias)
+            item["mention_count"] += len(matches)
+            append_unique_ref(item, add_science_evidence(record, "target", target.name or alias, section["section"], quote))
+    return sorted(found.values(), key=lambda item: item.get("mention_count", 0), reverse=True)[:12]
+
+
+def extract_methods_from_sections(sections: list[dict[str, str]], record: ScienceRecord) -> list[dict[str, Any]]:
+    method_rules = [
+        ("transit spectroscopy", ["transit spectroscopy", "transmission spectrum", "transmission spectroscopy"]),
+        ("radial velocity", ["radial velocity", "RV measurements", "HARPS", "ESPRESSO"]),
+        ("direct imaging", ["direct imaging", "coronagraph", "high contrast imaging"]),
+        ("optical interferometry", ["optical interferometry", "interferometer", "nulling interferometry", "VLTI", "CHARA"]),
+        ("photometry", ["photometry", "light curve", "TESS", "Kepler", "K2"]),
+        ("spectroscopy", ["spectroscopy", "spectrograph", "NIRSpec", "MIRI", "JWST", "HST"]),
+        ("astrometry", ["astrometry", "Gaia"]),
+        ("simulation/modeling", ["simulation", "modeling", "retrieval", "radiative transfer", "MCMC", "Bayesian"]),
+    ]
+    found: dict[str, dict[str, Any]] = {}
+    for section in sections:
+        sentences = split_evidence_sentences(section["text"])
+        lower = section["text"].lower()
+        for label, keywords in method_rules:
+            matched = [keyword for keyword in keywords if keyword.lower() in lower]
+            if not matched:
+                continue
+            quote = next((sentence for sentence in sentences if any(keyword.lower() in sentence.lower() for keyword in matched)), clean_text(section["text"])[:300])
+            item = found.setdefault(label, {"name": label, "keywords": [], "evidence_refs": []})
+            for keyword in matched:
+                if keyword not in item["keywords"]:
+                    item["keywords"].append(keyword)
+            if len(item["evidence_refs"]) < 3:
+                item["evidence_refs"].append(add_science_evidence(record, "method", label, section["section"], quote))
+    return list(found.values())[:10]
+
+
+def extract_parameters_from_sections(sections: list[dict[str, str]], record: ScienceRecord) -> list[dict[str, Any]]:
+    parameter_specs = [
+        ("distance", r"\b(?:distance|d)\s*(?:=|is|of|:)?\s*(?:about|approximately|~)?\s*([0-9]+(?:\.[0-9]+)?)\s*(pc|parsec|parsecs|ly|light[- ]years)\b"),
+        ("radius", r"\b(?:radius|R[_\s]?[A-Za-z0-9*⊙☉]+?)\s*(?:=|is|of|:)?\s*(?:about|approximately|~)?\s*([0-9]+(?:\.[0-9]+)?)\s*(R[_\s]?(?:sun|Sun|⊙|☉|Jup|Jupiter|Earth|⊕)|solar radii|Earth radii|Jupiter radii)\b"),
+        ("mass", r"\b(?:mass|M[_\s]?[A-Za-z0-9*⊙☉]+?)\s*(?:=|is|of|:)?\s*(?:about|approximately|~)?\s*([0-9]+(?:\.[0-9]+)?)\s*(M[_\s]?(?:sun|Sun|⊙|☉|Jup|Jupiter|Earth|⊕)|solar masses|Earth masses|Jupiter masses)\b"),
+        ("temperature", r"\b(?:temperature|T[_\s]?eff|effective temperature|T_eff)\s*(?:=|is|of|:)?\s*(?:about|approximately|~)?\s*([0-9]{3,6}(?:\.[0-9]+)?)\s*(K|kelvin)\b"),
+        ("orbital_period", r"\b(?:orbital period|period|P)\s*(?:=|is|of|:)?\s*(?:about|approximately|~)?\s*([0-9]+(?:\.[0-9]+)?)\s*(days|day|d|hours|hr|yrs|yr|years)\b"),
+    ]
+    found: dict[str, dict[str, Any]] = {
+        name: {"name": name, "value": "", "unit": "", "target": "", "evidence_refs": []}
+        for name, _pattern in parameter_specs
+    }
+    for section in sections:
+        sentences = split_evidence_sentences(section["text"])
+        for name, pattern in parameter_specs:
+            if found[name]["value"]:
+                continue
+            match = re.search(pattern, section["text"], flags=re.IGNORECASE)
+            if not match:
+                continue
+            value = match.group(1)
+            unit = match.group(2)
+            quote = next((sentence for sentence in sentences if match.group(0).lower() in sentence.lower()), clean_text(section["text"])[:300])
+            found[name]["value"] = value
+            found[name]["unit"] = unit
+            found[name]["evidence_refs"].append(add_science_evidence(record, "parameter", name, section["section"], quote))
+    return list(found.values())
+
+
+def extract_conclusions_from_sections(sections: list[dict[str, str]], record: ScienceRecord) -> list[dict[str, Any]]:
+    preferred_sections = [section for section in sections if re.search(r"conclusion|summary|discussion|result", section["section"], flags=re.IGNORECASE)]
+    candidate_sections = preferred_sections or sections[-3:]
+    conclusion_keywords = ["we find", "we found", "we conclude", "we show", "our results", "suggest", "indicate", "demonstrate", "conclude"]
+    conclusions: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for section in candidate_sections:
+        for sentence in split_evidence_sentences(section["text"]):
+            lower = sentence.lower()
+            if not any(keyword in lower for keyword in conclusion_keywords):
+                continue
+            key = sentence[:120].lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            evidence_index = add_science_evidence(record, "conclusion", "conclusion", section["section"], sentence)
+            conclusions.append({"text": sentence[:500], "evidence_refs": [evidence_index]})
+            if len(conclusions) >= 5:
+                return conclusions
+    return conclusions
+
+
+def extract_science_from_text(paper_id: str, text: str, source: str = "abstract") -> ScienceRecord:
+    sections = markdown_sections(text)
+    record = ScienceRecord(paper_id=paper_id, source=source)
+    record.targets = extract_target_mentions_from_text(paper_id, text, sections, record)
+    record.methods = extract_methods_from_sections(sections, record)
+    record.parameters = extract_parameters_from_sections(sections, record)
+    record.conclusions = extract_conclusions_from_sections(sections, record)
+    return record
+
+
+def science_record_for_paper(paper: Paper, force: bool = False) -> ScienceRecord:
+    paper_id = paper_id_for(paper)
+    text, source, resolved_paper_id = paper_text_source(paper)
+    existing = load_science_records().get(paper_id)
+    if existing and not force and existing.extractor_version == SCIENCE_EXTRACTOR_VERSION and not (existing.source != "markdown" and source == "markdown"):
+        return existing
+    record = extract_science_from_text(resolved_paper_id or paper_id, text, source)
+    return save_science_record(record)
+
+
+def science_record_for_record(record: PaperRecord, force: bool = False) -> ScienceRecord:
+    existing = load_science_records().get(record.paper_id)
+    md_path = resolve_record_markdown_path(record)
+    source = "markdown" if md_path else "abstract"
+    if existing and not force and existing.extractor_version == SCIENCE_EXTRACTOR_VERSION and not (existing.source != "markdown" and source == "markdown"):
+        return existing
+    if md_path:
+        text = md_path.read_text(encoding="utf-8", errors="replace")[: int(CONFIG.get("science_markdown_max_chars", 120000))]
+    else:
+        text = record.title or record.paper_id
+    return save_science_record(extract_science_from_text(record.paper_id, text, source))
 
 
 def mineru_runtime_dir(record: PaperRecord) -> Path:
@@ -2201,21 +2553,32 @@ def start_parse_task_for_record(record: PaperRecord) -> ParseTask:
 
 
 def deepseek_single_paper_analysis(topic: str, paper: Paper) -> dict[str, Any]:
+    full_text, text_source, _paper_id = paper_text_source(paper)
+    science_record = science_record_for_paper(paper)
     fallback = {
         "ok": True,
         "provider": "local_fallback",
         "analysis": fallback_paper_chinese_summary(topic, paper),
+        "text_source": text_source,
+        "science_record": asdict(science_record),
     }
     if not CONFIG.get("deepseek_enabled", True) or not os.getenv("DEEPSEEK_API_KEY"):
         return fallback
     key_material = json.dumps(
-        {"topic": topic, "paper": asdict(paper), "mode": "single_paper_detail_v1"},
+        {
+            "topic": topic,
+            "paper": asdict(paper),
+            "mode": "single_paper_detail_v2",
+            "text_source": text_source,
+            "text_hash": hashlib.sha1(full_text[:80000].encode("utf-8", errors="ignore")).hexdigest(),
+        },
         ensure_ascii=False,
         sort_keys=True,
     )
     cached = read_cache("deepseek_single_paper", key_material, max_age_hours=24 * 30)
     if isinstance(cached, dict):
         return cached
+    analysis_text = full_text[:60000] if text_source == "markdown" else paper.abstract
     prompt = {
         "topic": topic,
         "paper": {
@@ -2225,11 +2588,15 @@ def deepseek_single_paper_analysis(topic: str, paper: Paper) -> dict[str, Any]:
             "source": paper.source,
             "url": paper.url,
             "abstract": paper.abstract,
+            "text_source": text_source,
+            "full_text_or_abstract": analysis_text,
+            "light_science_record": asdict(science_record),
         },
         "requirements": [
-            "请基于题名和英文摘要生成中文详细分析，不要编造摘要中没有的信息。",
+            "请优先基于 full_text_or_abstract 字段生成中文详细分析；当 text_source=markdown 时，它来自 MinerU 生成的全文 Markdown。",
+            "不要编造原文中没有的信息；未在全文中出现的物理参数不要补充。",
             "说明研究问题、数据/方法、主要发现或贡献、局限性、与检索话题的关系。",
-            "如果能辅助天文观测目标筛选，请指出涉及的恒星/宿主星/天体名称和筛选价值；如果不能，也请说明原因。",
+            "如果能辅助天文观测目标筛选，请指出涉及的恒星/宿主星/天体名称和筛选价值，并参考 light_science_record 中的证据。",
             "输出 JSON 对象。",
         ],
         "output_schema": {
@@ -2256,6 +2623,8 @@ def deepseek_single_paper_analysis(topic: str, paper: Paper) -> dict[str, Any]:
             "key_points": [clean_text(str(item)) for item in parsed.get("key_points", [])][:8],
             "target_relevance": clean_text(str(parsed.get("target_relevance", ""))),
             "mentioned_targets": [clean_text(str(item)) for item in parsed.get("mentioned_targets", [])][:20],
+            "text_source": text_source,
+            "science_record": asdict(science_record),
         }
         if not result["analysis"]:
             return fallback
@@ -2274,6 +2643,11 @@ def serialize_paper_for_topic(topic: str, paper: Paper, summary_map: dict[str, s
         data["paper_record"] = record
         data["fetch_status"] = record.get("fetch_status")
         data["pdf_path"] = record.get("pdf_path")
+        data["markdown_path"] = record.get("markdown_path")
+    science = load_science_records().get(data["paper_id"])
+    if science:
+        data["science_record"] = asdict(science)
+        data["science_source"] = science.source
     return data
 
 def target_mentions_from_papers(target: Target, papers: list[Paper]) -> list[Paper]:
@@ -2337,7 +2711,9 @@ def extract_observation_targets(topic: str, papers: list[Paper]) -> list[dict[st
             if len(alias) >= 4:
                 alias_lookup.append((alias, target))
     for paper in papers:
-        text = f"{paper.title} {paper.abstract}"
+        full_text, text_source, _resolved_paper_id = paper_text_source(paper, max_chars=90000)
+        text = full_text or f"{paper.title} {paper.abstract}"
+        science = science_record_for_paper(paper)
         for pattern in patterns:
             for match in re.finditer(pattern, text, flags=re.IGNORECASE):
                 raw_name = re.sub(r"\s+", " ", match.group(0)).strip()
@@ -2354,6 +2730,7 @@ def extract_observation_targets(topic: str, papers: list[Paper]) -> list[dict[st
                         "paper_keys": set(),
                         "mention_count": 0,
                         "normalized_from_planet": is_likely_planet_name(raw_name, name),
+                        "evidence": [],
                     },
                 )
                 item["mention_count"] += len(re.findall(pattern, text, flags=re.IGNORECASE))
@@ -2361,6 +2738,12 @@ def extract_observation_targets(topic: str, papers: list[Paper]) -> list[dict[st
                 if paper_key not in item["paper_keys"]:
                     item["paper_keys"].add(paper_key)
                     item["papers"].append(paper)
+                if text_source == "markdown" and len(item["evidence"]) < 5:
+                    matched_target = next((target for target in science.targets if target.get("name", "").lower() == key), None)
+                    if matched_target:
+                        for ref_index in matched_target.get("evidence_refs", [])[:2]:
+                            if 0 <= int(ref_index) < len(science.evidence):
+                                item["evidence"].append(science.evidence[int(ref_index)])
         lower_text = text.lower()
         for alias, target in alias_lookup:
             if alias.lower() in lower_text:
@@ -2375,6 +2758,7 @@ def extract_observation_targets(topic: str, papers: list[Paper]) -> list[dict[st
                         "papers": [],
                         "paper_keys": set(),
                         "mention_count": 0,
+                        "evidence": [],
                     },
                 )
                 item["mention_count"] += lower_text.count(alias.lower())
@@ -2382,11 +2766,18 @@ def extract_observation_targets(topic: str, papers: list[Paper]) -> list[dict[st
                 if paper_key not in item["paper_keys"]:
                     item["paper_keys"].add(paper_key)
                     item["papers"].append(paper)
+                if text_source == "markdown" and len(item["evidence"]) < 5:
+                    matched_target = next((target_item for target_item in science.targets if alias in target_item.get("aliases", [])), None)
+                    if matched_target:
+                        for ref_index in matched_target.get("evidence_refs", [])[:2]:
+                            if 0 <= int(ref_index) < len(science.evidence):
+                                item["evidence"].append(science.evidence[int(ref_index)])
     result = []
     for item in candidates.values():
         item["papers"] = dedupe_papers(item["papers"])
         item["related_paper_count"] = len(item["papers"])
         item.pop("paper_keys", None)
+        item["evidence"] = item.get("evidence", [])[:8]
         result.append(item)
     result.sort(key=lambda item: (len(item["papers"]), item["mention_count"]), reverse=True)
     return result
@@ -2425,8 +2816,7 @@ def build_topic_hotspots(topic: str, limit: int | None = None, timeframe_months:
     results: list[dict[str, Any]] = []
     if not papers:
         output_path = ROOT / CONFIG["output_file"]
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text("[]", encoding="utf-8")
+        try_write_text(output_path, "[]", encoding="utf-8")
         output = {
             "generated_at": datetime.now().isoformat(timespec="seconds"),
             "mode": "topic",
@@ -2471,6 +2861,11 @@ def build_topic_hotspots(topic: str, limit: int | None = None, timeframe_months:
                 "related_paper_count": extracted.get("related_paper_count", len(matched)),
                 "heat": score["heat"],
                 "matched": True,
+                "evidence": extracted.get("evidence", [])[:8],
+                "match_reasons": [
+                    "全文证据命中" if extracted.get("evidence") else "题名/摘要命中",
+                    f"提及 {extracted.get('mention_count', len(matched))} 次",
+                ],
                 "papers": [
                     serialize_paper_for_topic(topic, paper)
                     for paper in matched[:10]
@@ -2497,8 +2892,7 @@ def build_topic_hotspots(topic: str, limit: int | None = None, timeframe_months:
     results.sort(key=lambda item: float(item.get("heat", 0)), reverse=True)
     results = results[: int(limit or CONFIG["max_targets_per_run"])]
     output_path = ROOT / CONFIG["output_file"]
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    try_write_text(output_path, json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     output = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "mode": "topic",
@@ -2754,8 +3148,7 @@ def build_hotspots(limit: int | None = None, use_seed: bool = False, timeframe_m
     results.sort(key=lambda item: float(item.get("heat", 0)), reverse=True)
     output = {"generated_at": datetime.now().isoformat(timespec="seconds"), "timeframe_months": timeframe_months, "items": results, "validation": validate_hotspots(results, targets)}
     output_path = ROOT / CONFIG["output_file"]
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    try_write_text(output_path, json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     log_event("热点分析完成", {"count": len(results), "output": str(output_path)})
     return output
 
@@ -2946,6 +3339,19 @@ class LiteratureAssistantHandler(SimpleHTTPRequestHandler):
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
+            elif path == "/api/paper/science":
+                paper_id = clean_text(str(query.get("paper_id", [""])[0] or query.get("id", [""])[0] or ""))
+                if not paper_id:
+                    json_response(self, {"ok": False, "error": "missing paper_id"}, HTTPStatus.BAD_REQUEST)
+                    return
+                science = load_science_records().get(paper_id)
+                record = load_paper_records().get(paper_id)
+                if (not science or (science.source != "markdown" and record and resolve_record_markdown_path(record))) and record:
+                    science = science_record_for_record(record)
+                if not science:
+                    json_response(self, {"ok": False, "error": "science record not found; parse Markdown or pass paper payload first"}, HTTPStatus.NOT_FOUND)
+                    return
+                json_response(self, {"ok": True, "record": asdict(science)})
             elif path == "/api/hotspots":
                 output_path = ROOT / CONFIG["output_file"]
                 if output_path.exists():
@@ -3029,6 +3435,25 @@ class LiteratureAssistantHandler(SimpleHTTPRequestHandler):
                 if task.status == "failed":
                     status = HTTPStatus.BAD_REQUEST
                 json_response(self, {"ok": task.status not in {"failed"}, "task": asdict(task), "record": task.record}, status)
+            elif parsed.path == "/api/paper/extract-science":
+                if not require_api_password(self, payload=payload):
+                    return
+                force = bool(payload.get("force", False))
+                paper_id = clean_text(str(payload.get("paper_id") or payload.get("id") or ""))
+                paper_payload = payload.get("paper") if isinstance(payload.get("paper"), dict) else payload
+                record = load_paper_records().get(paper_id) if paper_id else None
+                if record:
+                    science = science_record_for_record(record, force=force)
+                elif isinstance(paper_payload, dict):
+                    paper = paper_from_payload(paper_payload)
+                    if not paper.title:
+                        json_response(self, {"ok": False, "error": "missing paper title"}, HTTPStatus.BAD_REQUEST)
+                        return
+                    science = science_record_for_paper(paper, force=force)
+                else:
+                    json_response(self, {"ok": False, "error": "missing paper_id or paper payload"}, HTTPStatus.BAD_REQUEST)
+                    return
+                json_response(self, {"ok": True, "record": asdict(science)})
             elif parsed.path == "/api/deepseek/config":
                 if not require_api_password(self, payload=payload):
                     return
