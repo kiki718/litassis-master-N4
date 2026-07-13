@@ -700,6 +700,7 @@ progress::-webkit-progress-value {
 
 .inline-analysis-button,
 .fetch-pdf-button,
+.upload-pdf-button,
 .parse-pdf-button,
 .preview-markdown-button,
 .science-info-button,
@@ -721,6 +722,7 @@ progress::-webkit-progress-value {
 
 .paper-actions .inline-analysis-button,
 .paper-actions .fetch-pdf-button,
+.paper-actions .upload-pdf-button,
 .paper-actions .parse-pdf-button,
 .paper-actions .preview-markdown-button,
 .paper-actions .science-info-button,
@@ -729,6 +731,7 @@ progress::-webkit-progress-value {
 }
 
 .fetch-pdf-button:disabled,
+.upload-pdf-button:disabled,
 .parse-pdf-button:disabled {
   cursor: wait;
   opacity: 0.65;
@@ -736,6 +739,7 @@ progress::-webkit-progress-value {
 
 .inline-analysis-button svg,
 .fetch-pdf-button svg,
+.upload-pdf-button svg,
 .parse-pdf-button svg,
 .preview-markdown-button svg,
 .science-info-button svg,

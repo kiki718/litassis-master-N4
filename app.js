@@ -408,6 +408,10 @@ function renderPaperItem(paper) {
           <i data-lucide="file-down"></i>
           <span>${record?.fetch_status === "success" ? "重新获取PDF" : "获取PDF"}</span>
         </button>
+        <button class="upload-pdf-button" data-paper-index="${paperIndex}" type="button">
+          <i data-lucide="upload"></i>
+          <span>上传PDF</span>
+        </button>
         ${pdfHref ? `<a class="open-pdf-link" href="${pdfHref}" target="_blank" rel="noopener"><i data-lucide="file-text"></i><span>打开PDF</span></a>` : ""}
         <button class="parse-pdf-button" data-paper-index="${paperIndex}" type="button" ${record?.fetch_status === "success" ? "" : "disabled"}>
           <i data-lucide="file-cog"></i>
@@ -722,6 +726,53 @@ async function fetchPaperPdf(paper, button) {
     refreshPaperViews();
   } catch (error) {
     setNotice(`PDF 获取失败：${error.message}`, "error");
+  } finally {
+    if (button) button.disabled = false;
+    if (label) label.textContent = originalLabel;
+  }
+}
+
+function choosePaperPdfForUpload(paper, button) {
+  if (!paper) return;
+  const input = document.createElement("input");
+  input.type = "file";
+  input.accept = "application/pdf,.pdf";
+  input.addEventListener("change", () => {
+    const file = input.files?.[0];
+    if (!file) return;
+    const looksLikePdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+    if (!looksLikePdf) {
+      setNotice("请选择 PDF 文件后再上传。", "warn");
+      return;
+    }
+    uploadPaperPdf(paper, file, button);
+  }, { once: true });
+  input.click();
+}
+
+async function uploadPaperPdf(paper, file, button) {
+  const label = button?.querySelector("span");
+  const originalLabel = label?.textContent || "上传PDF";
+  if (button) button.disabled = true;
+  if (label) label.textContent = "上传中...";
+  setNotice(`正在上传《${paper.title || "文献"}》的本地 PDF。`);
+  try {
+    const formData = new FormData();
+    formData.append("paper", JSON.stringify(paper));
+    formData.append("pdf", file, file.name);
+    const response = await fetch("/api/paper/upload-pdf", {
+      method: "POST",
+      body: formData
+    });
+    const payload = await response.json();
+    if (payload.record) mergePaperRecord(payload.record);
+    if (!response.ok || !payload.ok) {
+      throw new Error(payload.error || payload.record?.failure_reason || `HTTP ${response.status}`);
+    }
+    setNotice("本地 PDF 已保存，可直接打开或启动 MinerU 解析。", "ok");
+    refreshPaperViews();
+  } catch (error) {
+    setNotice(`PDF 上传失败：${error.message}`, "error");
   } finally {
     if (button) button.disabled = false;
     if (label) label.textContent = originalLabel;
@@ -1095,6 +1146,14 @@ document.addEventListener("click", (event) => {
   const index = Number(button.dataset.paperIndex);
   if (!Number.isInteger(index) || !papers[index]) return;
   fetchPaperPdf(papers[index], button);
+});
+
+document.addEventListener("click", (event) => {
+  const button = event.target.closest(".upload-pdf-button");
+  if (!button) return;
+  const index = Number(button.dataset.paperIndex);
+  if (!Number.isInteger(index) || !papers[index]) return;
+  choosePaperPdfForUpload(papers[index], button);
 });
 
 document.addEventListener("click", (event) => {

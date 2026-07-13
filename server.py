@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+from email import policy
+from email.parser import BytesParser
 import hashlib
 import html
 import http.client
@@ -1850,6 +1852,87 @@ def download_pdf_bytes(url: str) -> tuple[bytes | None, str | None, str | None]:
         return None, f"HTTP {exc.code}", url
     except (urllib.error.URLError, TimeoutError, http.client.IncompleteRead) as exc:
         return None, str(exc), url
+
+
+def parse_multipart_form(content_type: str, body: bytes) -> tuple[dict[str, str], dict[str, dict[str, Any]]]:
+    if "multipart/form-data" not in (content_type or "").lower():
+        raise ValueError("请求必须使用 multipart/form-data")
+    header = f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("utf-8")
+    message = BytesParser(policy=policy.default).parsebytes(header + body)
+    if not message.is_multipart():
+        raise ValueError("未识别到上传表单内容")
+    fields: dict[str, str] = {}
+    files: dict[str, dict[str, Any]] = {}
+    for part in message.iter_parts():
+        if part.get_content_disposition() != "form-data":
+            continue
+        name = part.get_param("name", header="content-disposition")
+        if not name:
+            continue
+        filename = part.get_param("filename", header="content-disposition")
+        content = part.get_payload(decode=True) or b""
+        if filename is not None:
+            files[str(name)] = {
+                "filename": str(filename),
+                "content_type": part.get_content_type(),
+                "content": content,
+            }
+        else:
+            charset = part.get_content_charset() or "utf-8"
+            fields[str(name)] = content.decode(charset, errors="replace")
+    return fields, files
+
+
+def validate_pdf_upload(body: bytes) -> str | None:
+    if not body:
+        return "上传文件为空"
+    max_bytes = int(CONFIG.get("max_pdf_bytes", 80 * 1024 * 1024))
+    if len(body) > max_bytes:
+        return "PDF 文件超过大小上限"
+    if not body[:1024].lstrip().startswith(b"%PDF-"):
+        return "上传文件不是有效 PDF（缺少 %PDF- 文件头）"
+    return None
+
+
+def save_uploaded_paper_pdf(paper: Paper, payload: dict[str, Any], pdf_body: bytes, original_filename: str = "") -> PaperRecord:
+    ensure_dirs()
+    validation_error = validate_pdf_upload(pdf_body)
+    if validation_error:
+        raise ValueError(validation_error)
+    records = load_paper_records()
+    paper_id = paper_id_for(paper, payload)
+    existing = records.get(paper_id)
+    identifiers = paper_identifier_payload(paper, payload)
+    uploaded_name = Path(original_filename or "uploaded.pdf").name
+    source_label = f"local-upload:{uploaded_name}"
+    title = paper.title or Path(uploaded_name).stem
+    filename_stem = safe_filename(Path(uploaded_name or title).stem, 80)
+    filename = f"{safe_filename(paper_id)}_{filename_stem}.pdf"
+    pdf_path = ROOT / CONFIG.get("pdf_dir", "outputs/pdfs") / filename
+    pdf_path.write_bytes(pdf_body)
+    candidate_links = list(dict.fromkeys((existing.candidate_links if existing else []) + [source_label]))
+    record = PaperRecord(
+        paper_id=paper_id,
+        title=title,
+        arxiv_id=identifiers["arxiv_id"],
+        doi=identifiers["doi"],
+        version=identifiers["version"],
+        source_url=source_label,
+        download_time=datetime.now().isoformat(timespec="seconds"),
+        fetch_status="success",
+        failure_reason=None,
+        candidate_links=candidate_links,
+        pdf_path=relative_path(pdf_path),
+        markdown_path=None,
+        parse_status="not_started",
+        parse_error=None,
+        parse_time=None,
+        parser=None,
+    )
+    records[paper_id] = record
+    save_paper_records(records)
+    log_event("paper PDF uploaded", {"paper_id": paper_id, "filename": original_filename, "pdf_path": record.pdf_path})
+    return record
 
 
 def fetch_and_save_paper_pdf(paper: Paper, payload: dict[str, Any] | None = None) -> PaperRecord:
@@ -3869,6 +3952,28 @@ class LiteratureAssistantHandler(SimpleHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         try:
             length = int(self.headers.get("Content-Length", "0") or 0)
+            if parsed.path == "/api/paper/upload-pdf":
+                raw_body = self.rfile.read(length) if length else b""
+                fields, files = parse_multipart_form(self.headers.get("Content-Type", ""), raw_body)
+                if not require_api_password(self, payload=fields):
+                    return
+                paper_payload: dict[str, Any] = {}
+                if fields.get("paper"):
+                    parsed_paper = json.loads(fields["paper"])
+                    if isinstance(parsed_paper, dict):
+                        paper_payload = parsed_paper
+                if fields.get("paper_id"):
+                    paper_payload["paper_id"] = fields["paper_id"]
+                paper = paper_from_payload(paper_payload)
+                upload = files.get("pdf") or files.get("file")
+                if not upload:
+                    json_response(self, {"ok": False, "error": "missing pdf file"}, HTTPStatus.BAD_REQUEST)
+                    return
+                if not paper.title:
+                    paper.title = Path(str(upload.get("filename") or "uploaded.pdf")).stem
+                record = save_uploaded_paper_pdf(paper, paper_payload, bytes(upload.get("content") or b""), str(upload.get("filename") or "uploaded.pdf"))
+                json_response(self, {"ok": True, "record": asdict(record)})
+                return
             body = self.rfile.read(length).decode("utf-8") if length else "{}"
             payload = json.loads(body or "{}")
             if parsed.path == "/api/run":
