@@ -29,6 +29,17 @@
   "topic_relevance_threshold": 0.18,
   "recent_years": 2,
   "default_timeframe_months": 12,
+  "target_search_neighbor_radius_deg": 2.0,
+  "target_search_max_expanded_targets": 4,
+  "target_search_max_related_targets": 5,
+  "target_search_alias_limit": 10,
+  "target_search_strict_candidates": true,
+  "target_search_rank_weights": {
+    "semantic": 0.35,
+    "target": 0.30,
+    "evidence": 0.20,
+    "recency": 0.15
+  },
   "arxiv_enabled": true,
   "ads_enabled": true,
   "deepseek_enabled": true,

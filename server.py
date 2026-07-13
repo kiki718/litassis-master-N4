@@ -64,6 +64,17 @@ DEFAULT_CONFIG = {
     "topic_relevance_threshold": 0.18,
     "recent_years": 2,
     "default_timeframe_months": 12,
+    "target_search_neighbor_radius_deg": 2.0,
+    "target_search_max_expanded_targets": 4,
+    "target_search_max_related_targets": 5,
+    "target_search_alias_limit": 10,
+    "target_search_strict_candidates": True,
+    "target_search_rank_weights": {
+        "semantic": 0.35,
+        "target": 0.30,
+        "evidence": 0.20,
+        "recency": 0.15,
+    },
     "arxiv_enabled": True,
     "ads_enabled": True,
     "deepseek_enabled": True,
@@ -272,6 +283,15 @@ def split_aliases(value: str | None) -> list[str]:
     return result
 
 
+def add_alias_candidate(aliases: list[str], value: str | None, prefix: str = "") -> None:
+    value = clean_text(str(value or ""))
+    if not value:
+        return
+    alias = f"{prefix}{value}" if prefix and not value.lower().startswith(prefix.strip().lower()) else value
+    if alias and alias not in aliases:
+        aliases.append(alias)
+
+
 def load_targets() -> list[Target]:
     target_file = ROOT / CONFIG["target_file"]
     if not target_file.exists():
@@ -289,11 +309,17 @@ def load_targets() -> list[Target]:
         tic_name = row.get("tic_name") or f"TIC {target_id}"
         if tic_name not in aliases:
             aliases.append(tic_name)
+        add_alias_candidate(aliases, row.get("simbad_main_id"))
+        add_alias_candidate(aliases, row.get("mast_hip"), "HIP ")
+        add_alias_candidate(aliases, row.get("mast_tyc"), "TYC ")
+        add_alias_candidate(aliases, row.get("mast_gaia"), "Gaia DR3 ")
+        add_alias_candidate(aliases, row.get("mast_twomass"), "2MASS J")
+        add_alias_candidate(aliases, row.get("mast_kic"), "KIC ")
         targets.append(
             Target(
                 id=str(target_id),
                 name=name,
-                aliases=aliases[:12],
+                aliases=aliases[:24],
                 ra_deg=row.get("ra_deg"),
                 dec_deg=row.get("dec_deg"),
                 vmag=row.get("vmag"),
@@ -357,6 +383,203 @@ def build_search_terms(target: Target) -> list[str]:
             seen.add(key)
             cleaned.append(normalized)
     return cleaned[:5]
+
+
+def parse_float(value: Any) -> float | None:
+    try:
+        if value is None or str(value).strip() == "":
+            return None
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def target_alias_terms(target: Target, limit: int | None = None) -> list[str]:
+    terms = [target.name or "", f"TIC {target.id}", *target.aliases]
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for term in terms:
+        normalized = re.sub(r"\s+", " ", clean_text(str(term))).strip()
+        key = normalized.lower()
+        if normalized and key not in seen:
+            seen.add(key)
+            cleaned.append(normalized)
+    return cleaned[:limit] if limit else cleaned
+
+
+def angular_separation_deg(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
+    ra1_rad = math.radians(ra1)
+    ra2_rad = math.radians(ra2)
+    dec1_rad = math.radians(dec1)
+    dec2_rad = math.radians(dec2)
+    cos_angle = (
+        math.sin(dec1_rad) * math.sin(dec2_rad)
+        + math.cos(dec1_rad) * math.cos(dec2_rad) * math.cos(ra1_rad - ra2_rad)
+    )
+    return math.degrees(math.acos(max(-1.0, min(1.0, cos_angle))))
+
+
+def parse_target_search_coordinates(query: str) -> dict[str, float] | None:
+    text = clean_text(query)
+    radius = float(CONFIG.get("target_search_neighbor_radius_deg", 2.0))
+    radius_match = re.search(r"(?:radius|半径|within|附近)\s*[:=]?\s*([0-9]+(?:\.[0-9]+)?)\s*(?:deg|degree|degrees|度)?", text, flags=re.IGNORECASE)
+    if radius_match:
+        radius = float(radius_match.group(1))
+    labeled = re.search(
+        r"\bRA\s*[:=]\s*([0-9]+(?:\.[0-9]+)?)\s*[,;\s]+(?:Dec|DEC|dec)\s*[:=]\s*([+-]?[0-9]+(?:\.[0-9]+)?)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if labeled:
+        ra = float(labeled.group(1))
+        dec = float(labeled.group(2))
+    else:
+        pair = re.search(r"\b([0-9]{1,3}(?:\.[0-9]+)?)\s*,\s*([+-]?[0-9]{1,2}(?:\.[0-9]+)?)\b", text)
+        if not pair:
+            return None
+        ra = float(pair.group(1))
+        dec = float(pair.group(2))
+    if 0 <= ra <= 360 and -90 <= dec <= 90:
+        return {"ra_deg": ra, "dec_deg": dec, "radius_deg": radius}
+    return None
+
+
+def target_base_aliases(target: Target) -> set[str]:
+    bases: set[str] = set()
+    for alias in target_alias_terms(target):
+        base = re.sub(r"\b(?:A|B|C|D|Aa|Ab|Ba|Bb)\b$", "", alias, flags=re.IGNORECASE).strip()
+        base = re.sub(r"\s+", " ", base).lower()
+        if len(base) >= 4:
+            bases.add(base)
+    return bases
+
+
+def shared_catalog_values(target: Target) -> set[str]:
+    keys = ["mast_hip", "mast_tyc", "mast_gaia", "mast_twomass", "mast_kic"]
+    return {clean_text(str(target.raw.get(key) or "")).lower() for key in keys if clean_text(str(target.raw.get(key) or ""))}
+
+
+def target_to_ref(target: Target, relation: str = "self", distance_deg: float | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": target.id,
+        "name": target.name,
+        "aliases": target_alias_terms(target, int(CONFIG.get("target_search_alias_limit", 10))),
+        "ra_deg": parse_float(target.ra_deg),
+        "dec_deg": parse_float(target.dec_deg),
+        "relation": relation,
+    }
+    if distance_deg is not None:
+        payload["distance_deg"] = round(distance_deg, 4)
+    return payload
+
+
+def nearby_targets(center: Target | dict[str, float], targets: list[Target], radius_deg: float, exclude_ids: set[str] | None = None) -> list[dict[str, Any]]:
+    exclude_ids = exclude_ids or set()
+    center_ra = parse_float(center.get("ra_deg") if isinstance(center, dict) else center.ra_deg)
+    center_dec = parse_float(center.get("dec_deg") if isinstance(center, dict) else center.dec_deg)
+    if center_ra is None or center_dec is None:
+        return []
+    nearby: list[tuple[float, Target]] = []
+    for target in targets:
+        if target.id in exclude_ids:
+            continue
+        ra = parse_float(target.ra_deg)
+        dec = parse_float(target.dec_deg)
+        if ra is None or dec is None:
+            continue
+        distance = angular_separation_deg(center_ra, center_dec, ra, dec)
+        if distance <= radius_deg:
+            nearby.append((distance, target))
+    nearby.sort(key=lambda item: item[0])
+    return [
+        target_to_ref(target, "nearby_sky", distance)
+        for distance, target in nearby[: int(CONFIG.get("target_search_max_related_targets", 5))]
+    ]
+
+
+def companion_targets(seed: Target, targets: list[Target]) -> list[dict[str, Any]]:
+    seed_bases = target_base_aliases(seed)
+    seed_catalog_values = shared_catalog_values(seed)
+    related: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for target in targets:
+        if target.id == seed.id or target.id in seen:
+            continue
+        relation = ""
+        if seed_bases.intersection(target_base_aliases(target)):
+            relation = "host_or_companion_alias"
+        elif seed_catalog_values and seed_catalog_values.intersection(shared_catalog_values(target)):
+            relation = "shared_catalog_system"
+        if relation:
+            seen.add(target.id)
+            related.append(target_to_ref(target, relation))
+    return related[: int(CONFIG.get("target_search_max_related_targets", 5))]
+
+
+def match_targets_for_query(query: str, targets: list[Target]) -> list[dict[str, Any]]:
+    text = clean_text(query)
+    matches: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for target in targets:
+        matched_aliases: list[str] = []
+        if re.search(rf"(?<!\d){re.escape(target.id)}(?!\d)", text):
+            matched_aliases.append(target.id)
+        for alias in target_alias_terms(target):
+            if len(alias) < 3:
+                continue
+            if entity_term_matches(text, alias):
+                matched_aliases.append(alias)
+        if matched_aliases and target.id not in seen:
+            seen.add(target.id)
+            matches.append({"target": target, "matched_aliases": matched_aliases[:5], "match_type": "alias"})
+    return matches[: int(CONFIG.get("target_search_max_expanded_targets", 4))]
+
+
+def build_target_search_context(query: str) -> dict[str, Any]:
+    targets = load_targets()
+    radius = float(CONFIG.get("target_search_neighbor_radius_deg", 2.0))
+    coordinate_query = parse_target_search_coordinates(query)
+    seed_matches = match_targets_for_query(query, targets)
+    if coordinate_query:
+        radius = float(coordinate_query.get("radius_deg", radius))
+        coordinate_neighbors = nearby_targets(coordinate_query, targets, radius)
+        for item in coordinate_neighbors[: int(CONFIG.get("target_search_max_expanded_targets", 4))]:
+            target = next((candidate for candidate in targets if candidate.id == item["id"]), None)
+            if target and not any(match["target"].id == target.id for match in seed_matches):
+                seed_matches.append({"target": target, "matched_aliases": [f"坐标半径 {radius:g} deg"], "match_type": "coordinate"})
+    expanded: list[dict[str, Any]] = []
+    for match in seed_matches[: int(CONFIG.get("target_search_max_expanded_targets", 4))]:
+        target = match["target"]
+        related = companion_targets(target, targets)
+        existing_ids = {target.id, *(item["id"] for item in related)}
+        related.extend(nearby_targets(target, targets, radius, existing_ids))
+        expanded.append(
+            {
+                "target": target_to_ref(target, match["match_type"]),
+                "matched_aliases": match["matched_aliases"],
+                "aliases": target_alias_terms(target, int(CONFIG.get("target_search_alias_limit", 10))),
+                "related_targets": related[: int(CONFIG.get("target_search_max_related_targets", 5))],
+            }
+        )
+    return {
+        "enabled": bool(expanded or coordinate_query),
+        "query": {
+            "raw": query,
+            "coordinates": coordinate_query,
+            "neighbor_radius_deg": radius,
+        },
+        "targets": expanded,
+    }
+
+
+def target_from_ref(ref: dict[str, Any]) -> Target:
+    return Target(
+        id=str(ref.get("id") or make_target_id(str(ref.get("name") or "target"))),
+        name=clean_text(str(ref.get("name") or "")) or None,
+        aliases=[clean_text(str(alias)) for alias in ref.get("aliases", []) if clean_text(str(alias))],
+        ra_deg=str(ref.get("ra_deg") or "") or None,
+        dec_deg=str(ref.get("dec_deg") or "") or None,
+    )
 
 
 def cutoff_for_months(months: int | None) -> date | None:
@@ -876,9 +1099,26 @@ def fallback_topic_papers(topic: str, timeframe_months: int | None = None) -> li
     ]
 
 
-def collect_topic_papers(topic: str, timeframe_months: int | None = None, limit: int | None = None) -> list[Paper]:
+def collect_topic_papers(topic: str, timeframe_months: int | None = None, limit: int | None = None, target_context: dict[str, Any] | None = None) -> list[Paper]:
     max_topic_papers = None if limit is None or int(limit) <= 0 else int(limit)
     papers = arxiv_topic_search(topic, timeframe_months, max_topic_papers)
+    context = target_context or build_target_search_context(topic)
+    expanded_refs: list[dict[str, Any]] = []
+    for entry in context.get("targets", []):
+        expanded_refs.append(entry.get("target") or {})
+        expanded_refs.extend(entry.get("related_targets") or [])
+    seen_target_ids: set[str] = set()
+    for ref in expanded_refs:
+        target_id = str(ref.get("id") or "")
+        if not target_id or target_id in seen_target_ids:
+            continue
+        seen_target_ids.add(target_id)
+        target = target_from_ref(ref)
+        target_papers = ads_search(target, timeframe_months) + arxiv_search(target, timeframe_months)
+        for paper in target_papers:
+            paper.relevance = max(paper.relevance, topic_relevance(topic, paper.title, paper.abstract))
+            papers.append(paper)
+    papers = dedupe_papers(papers)
     return papers if max_topic_papers is None else papers[:max_topic_papers]
 
 
@@ -2783,6 +3023,214 @@ def extract_observation_targets(topic: str, papers: list[Paper]) -> list[dict[st
     return result
 
 
+def paper_rank_key(paper: Paper) -> str:
+    return re.sub(r"\W+", "", paper.title.lower())[:80] or paper.url
+
+
+def rank_weights() -> dict[str, float]:
+    defaults = {"semantic": 0.35, "target": 0.30, "evidence": 0.20, "recency": 0.15}
+    configured = CONFIG.get("target_search_rank_weights", {})
+    if isinstance(configured, dict):
+        defaults.update({key: float(value) for key, value in configured.items() if key in defaults})
+    return defaults
+
+
+def science_record_for_scoring(paper: Paper) -> ScienceRecord:
+    record = paper_record_for_paper(paper)
+    if record and resolve_record_markdown_path(record):
+        return science_record_for_paper(paper)
+    text = "\n\n".join([paper.title, paper.abstract])
+    return extract_science_from_text(paper_id_for(paper), text, "abstract")
+
+
+def evidence_signal_for_paper(paper: Paper, context: dict[str, Any]) -> tuple[float, list[str]]:
+    try:
+        science = science_record_for_scoring(paper)
+    except Exception as exc:
+        log_event("N4 science evidence scoring failed", {"title": paper.title, "error": str(exc)})
+        return 0.0, []
+    if not science.evidence and not science.targets:
+        return 0.0, []
+    signal = 0.25 if science.evidence else 0.1
+    reasons: list[str] = []
+    if science.source == "markdown" and science.evidence:
+        signal = max(signal, min(1.0, len(science.evidence) / 4))
+        reasons.append(f"MinerU全文证据 {len(science.evidence)} 条")
+    context_aliases = {
+        alias.lower()
+        for entry in context.get("targets", [])
+        for alias in [*(entry.get("aliases") or []), *(entry.get("matched_aliases") or [])]
+    }
+    for item in science.targets:
+        target_aliases = {str(item.get("name", "")).lower(), *(str(alias).lower() for alias in item.get("aliases", []))}
+        if context_aliases and target_aliases.intersection(context_aliases):
+            signal = max(signal, 0.9 if science.source == "markdown" else 0.55)
+            reasons.append(f"科学信息命中 {item.get('name')}")
+            break
+    return min(1.0, signal), reasons[:2]
+
+
+def recency_signal_for_paper(paper: Paper, timeframe_months: int | None = None) -> tuple[float, str]:
+    value = paper_date(paper)
+    if not value:
+        return 0.25, "年份未知"
+    days = (date.today() - value).days
+    if days <= 365:
+        return 1.0, "近一年文献"
+    if days <= 730:
+        return 0.75, "近两年文献"
+    cutoff = cutoff_for_months(timeframe_months)
+    if cutoff and value >= cutoff:
+        return 0.55, "处于所选时间范围"
+    return 0.2, f"{value.year} 年文献"
+
+
+def target_signal_for_paper(paper: Paper, context: dict[str, Any], text: str) -> tuple[float, list[str], dict[str, Any] | None]:
+    if not context.get("targets"):
+        return 0.0, [], None
+    best_signal = 0.0
+    best_reasons: list[str] = []
+    best_target: dict[str, Any] | None = None
+    for entry in context.get("targets", []):
+        target_ref = entry.get("target") or {}
+        direct_aliases = entry.get("aliases") or []
+        direct_hits = [alias for alias in direct_aliases if len(str(alias)) >= 3 and entity_term_matches(text, str(alias))]
+        signal = 0.0
+        reasons: list[str] = []
+        if paper.target_id and str(paper.target_id) == str(target_ref.get("id")):
+            signal = max(signal, 0.75)
+            reasons.append(f"目标检索 {target_ref.get('name') or target_ref.get('id')}")
+        if direct_hits:
+            signal = max(signal, 1.0)
+            reasons.append(f"命中别名 {direct_hits[0]}")
+        for related in entry.get("related_targets") or []:
+            aliases = related.get("aliases") or []
+            related_hits = [alias for alias in aliases if len(str(alias)) >= 3 and entity_term_matches(text, str(alias))]
+            if related_hits:
+                signal = max(signal, 0.65)
+                distance = related.get("distance_deg")
+                if distance is not None:
+                    reasons.append(f"邻近天区 {related.get('name') or related.get('id')} ({float(distance):.2f} deg)")
+                else:
+                    reasons.append(f"扩展关系 {related.get('name') or related.get('id')}")
+                break
+        if signal > best_signal:
+            best_signal = signal
+            best_reasons = reasons
+            best_target = target_ref
+    return best_signal, best_reasons[:2], best_target
+
+
+def score_paper_for_target_search(topic: str, paper: Paper, context: dict[str, Any], timeframe_months: int | None = None) -> dict[str, Any]:
+    text, _source, _resolved = paper_text_source(paper, max_chars=90000)
+    text = text or f"{paper.title} {paper.abstract}"
+    semantic_signal = max(float(paper.relevance or 0.0), topic_relevance(topic, paper.title, paper.abstract))
+    target_signal, target_reasons, matched_target = target_signal_for_paper(paper, context, text)
+    evidence_signal, evidence_reasons = evidence_signal_for_paper(paper, context)
+    recency_signal, recency_reason = recency_signal_for_paper(paper, timeframe_months)
+    weights = rank_weights()
+    total_weight = sum(weights.values()) or 1.0
+    score = (
+        semantic_signal * weights["semantic"]
+        + target_signal * weights["target"]
+        + evidence_signal * weights["evidence"]
+        + recency_signal * weights["recency"]
+    ) / total_weight
+    reasons = []
+    if semantic_signal >= 0.35:
+        reasons.append(f"语义相关度 {semantic_signal:.2f}")
+    reasons.extend(target_reasons)
+    reasons.extend(evidence_reasons)
+    reasons.append(recency_reason)
+    return {
+        "rank_score": round(min(100.0, score * 100), 1),
+        "rank_reasons": reasons[:5],
+        "matched_target": matched_target,
+        "score_breakdown": {
+            "semantic_relevance": round(semantic_signal * 35, 1),
+            "target_region_relevance": round(target_signal * 30, 1),
+            "full_text_evidence": round(evidence_signal * 20, 1),
+            "recent_trend": round(recency_signal * 15, 1),
+        },
+    }
+
+
+def rerank_papers_for_target_search(topic: str, papers: list[Paper], context: dict[str, Any], timeframe_months: int | None = None) -> tuple[list[Paper], dict[str, dict[str, Any]]]:
+    rank_map: dict[str, dict[str, Any]] = {}
+    for paper in papers:
+        rank_map[paper_rank_key(paper)] = score_paper_for_target_search(topic, paper, context, timeframe_months)
+    ordered = sorted(papers, key=lambda item: rank_map.get(paper_rank_key(item), {}).get("rank_score", 0), reverse=True)
+    return ordered, rank_map
+
+
+def serialize_ranked_paper(topic: str, paper: Paper, rank_map: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    data = serialize_paper_for_topic(topic, paper)
+    rank_info = rank_map.get(paper_rank_key(paper), {})
+    data.update(rank_info)
+    return data
+
+
+def score_breakdown_average(rank_infos: list[dict[str, Any]]) -> dict[str, float]:
+    if not rank_infos:
+        return {}
+    keys = ["semantic_relevance", "target_region_relevance", "full_text_evidence", "recent_trend"]
+    return {
+        key: round(sum(float(info.get("score_breakdown", {}).get(key, 0)) for info in rank_infos) / len(rank_infos), 1)
+        for key in keys
+    }
+
+
+def compact_target_search_context(context: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "query": context.get("query", {}),
+        "strict_candidates": bool(CONFIG.get("target_search_strict_candidates", True)),
+        "filtered_candidate_count": int(context.get("filtered_candidate_count") or 0),
+        "targets": [
+            {
+                "target": entry.get("target"),
+                "matched_aliases": entry.get("matched_aliases", []),
+                "aliases": entry.get("aliases", [])[: int(CONFIG.get("target_search_alias_limit", 10))],
+                "related_targets": entry.get("related_targets", []),
+            }
+            for entry in context.get("targets", [])
+        ],
+    }
+
+
+def expansion_for_candidate(candidate: dict[str, Any], context: dict[str, Any]) -> dict[str, Any] | None:
+    candidate_id = str(candidate.get("matched_catalog_id") or candidate.get("id") or "")
+    candidate_name = str(candidate.get("name") or "").lower()
+    for entry in context.get("targets", []):
+        target_ref = entry.get("target") or {}
+        target_aliases = {str(alias).lower() for alias in entry.get("aliases", [])}
+        if candidate_id and candidate_id == str(target_ref.get("id")):
+            return entry
+        if candidate_name and (candidate_name == str(target_ref.get("name") or "").lower() or candidate_name in target_aliases):
+            return entry
+        for related in entry.get("related_targets", []):
+            related_aliases = {str(alias).lower() for alias in related.get("aliases", [])}
+            if candidate_id and candidate_id == str(related.get("id")):
+                return {"target": related, "aliases": related.get("aliases", []), "matched_aliases": [], "related_targets": [], "source_expansion": entry.get("target")}
+            if candidate_name and (candidate_name == str(related.get("name") or "").lower() or candidate_name in related_aliases):
+                return {"target": related, "aliases": related.get("aliases", []), "matched_aliases": [], "related_targets": [], "source_expansion": entry.get("target")}
+    return None
+
+
+def constrain_extracted_targets_for_context(extracted_targets: list[dict[str, Any]], context: dict[str, Any]) -> tuple[list[dict[str, Any]], int]:
+    if not CONFIG.get("target_search_strict_candidates", True) or not context.get("targets"):
+        return extracted_targets, 0
+    kept: list[dict[str, Any]] = []
+    filtered = 0
+    for item in extracted_targets:
+        expansion = expansion_for_candidate(item, context)
+        if expansion:
+            item["target_expansion"] = expansion
+            kept.append(item)
+        else:
+            filtered += 1
+    return kept, filtered
+
+
 def validate_extracted_hotspots(hotspots: list[dict[str, Any]]) -> dict[str, Any]:
     duplicate_ids = []
     seen = set()
@@ -2810,7 +3258,9 @@ def build_topic_hotspots(topic: str, limit: int | None = None, timeframe_months:
     timeframe_months = int(timeframe_months or CONFIG.get("default_timeframe_months", 12))
     if max_papers is None:
         max_papers = int(CONFIG.get("max_topic_papers", 200))
-    papers = collect_topic_papers(topic, timeframe_months, limit=max_papers)
+    target_context = build_target_search_context(topic)
+    papers = collect_topic_papers(topic, timeframe_months, limit=max_papers, target_context=target_context)
+    papers, paper_rank_map = rerank_papers_for_target_search(topic, papers, target_context, timeframe_months)
     topic_summary = summarize_topic(topic, papers)
     corpus_path = write_literature_corpus(topic, papers, timeframe_months)
     results: list[dict[str, Any]] = []
@@ -2822,6 +3272,7 @@ def build_topic_hotspots(topic: str, limit: int | None = None, timeframe_months:
             "mode": "topic",
             "topic": topic,
             "search_terms": topic_search_terms(topic),
+            "target_search": compact_target_search_context(target_context),
             "timeframe_months": timeframe_months,
             "topic_summary": topic_summary,
             "corpus_file": str(corpus_path),
@@ -2832,6 +3283,9 @@ def build_topic_hotspots(topic: str, limit: int | None = None, timeframe_months:
         log_event("topic analysis completed with no papers", {"topic": topic})
         return output
     extracted_targets = extract_observation_targets(topic, papers)
+    extracted_targets, filtered_candidate_count = constrain_extracted_targets_for_context(extracted_targets, target_context)
+    if filtered_candidate_count:
+        target_context["filtered_candidate_count"] = filtered_candidate_count
     llm_overview = deepseek_topic_overview(topic, papers, extracted_targets)
     if llm_overview:
         topic_summary = {
@@ -2847,27 +3301,55 @@ def build_topic_hotspots(topic: str, limit: int | None = None, timeframe_months:
         topic_summary = {**topic_summary, "analysis_provider": "local_fallback"}
     for extracted in extracted_targets:
         matched = extracted["papers"]
+        matched = sorted(matched, key=lambda paper: paper_rank_map.get(paper_rank_key(paper), {}).get("rank_score", 0), reverse=True)
+        matched_rank_infos = [paper_rank_map.get(paper_rank_key(paper), {}) for paper in matched]
+        top_rank = max([float(info.get("rank_score", 0)) for info in matched_rank_infos] or [0.0])
+        avg_rank = sum(float(info.get("rank_score", 0)) for info in matched_rank_infos[:3]) / max(1, min(3, len(matched_rank_infos)))
         pseudo_target = Target(id=str(extracted["id"]), name=extracted["name"])
         analysis = heuristic_analyze(pseudo_target, matched)
         score = score_target(pseudo_target, matched, analysis, timeframe_months)
+        expansion = extracted.get("target_expansion") or expansion_for_candidate(extracted, target_context)
+        rank_score = round(min(100.0, max(score["heat"], top_rank * 0.65 + avg_rank * 0.35)), 1)
+        reasons = []
+        if expansion:
+            matched_aliases = expansion.get("matched_aliases") or []
+            if matched_aliases:
+                reasons.append(f"检索扩展命中 {matched_aliases[0]}")
+            related_count = len(expansion.get("related_targets") or [])
+            if related_count:
+                reasons.append(f"扩展相关目标 {related_count} 个")
+        if any(info.get("rank_reasons") for info in matched_rank_infos):
+            for reason in matched_rank_infos[0].get("rank_reasons", []):
+                if reason not in reasons:
+                    reasons.append(reason)
+        if extracted.get("evidence"):
+            reasons.append("全文证据命中")
+        reasons.append(f"提及 {extracted.get('mention_count', len(matched))} 次")
+        score_breakdown = {
+            **score["score_breakdown"],
+            **score_breakdown_average(matched_rank_infos[:5]),
+        }
         results.append(
             {
                 "id": str(extracted["id"]),
                 "name": extracted["name"],
+                "query": target_context.get("query", {}),
+                "target": expansion.get("target") if expansion else {"id": str(extracted["id"]), "name": extracted["name"]},
+                "aliases": expansion.get("aliases", []) if expansion else [],
+                "related_targets": expansion.get("related_targets", []) if expansion else [],
                 "matched_catalog_id": extracted.get("matched_catalog_id"),
                 "reference_catalog_id": extracted.get("matched_catalog_id"),
                 "in_reference_catalog": bool(extracted.get("matched_catalog_id")),
                 "mention_count": extracted.get("mention_count", len(matched)),
                 "related_paper_count": extracted.get("related_paper_count", len(matched)),
-                "heat": score["heat"],
+                "rank_score": rank_score,
+                "heat": rank_score,
                 "matched": True,
                 "evidence": extracted.get("evidence", [])[:8],
-                "match_reasons": [
-                    "全文证据命中" if extracted.get("evidence") else "题名/摘要命中",
-                    f"提及 {extracted.get('mention_count', len(matched))} 次",
-                ],
+                "match_reasons": reasons[:6],
+                "reasons": reasons[:6],
                 "papers": [
-                    serialize_paper_for_topic(topic, paper)
+                    serialize_ranked_paper(topic, paper, paper_rank_map)
                     for paper in matched[:10]
                 ],
                 "summary": (
@@ -2885,11 +3367,11 @@ def build_topic_hotspots(topic: str, limit: int | None = None, timeframe_months:
                 "analysis_provider": "literature-target-extraction",
                 "updated_at": date.today().isoformat(),
                 "timeframe_months": timeframe_months,
-                "score_breakdown": score["score_breakdown"],
+                "score_breakdown": score_breakdown,
                 "warnings": [],
             }
         )
-    results.sort(key=lambda item: float(item.get("heat", 0)), reverse=True)
+    results.sort(key=lambda item: float(item.get("rank_score", item.get("heat", 0))), reverse=True)
     results = results[: int(limit or CONFIG["max_targets_per_run"])]
     output_path = ROOT / CONFIG["output_file"]
     try_write_text(output_path, json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -2898,11 +3380,12 @@ def build_topic_hotspots(topic: str, limit: int | None = None, timeframe_months:
         "mode": "topic",
         "topic": topic,
         "search_terms": topic_search_terms(topic),
+        "target_search": compact_target_search_context(target_context),
         "timeframe_months": timeframe_months,
         "max_papers": max_papers or "unlimited",
         "topic_summary": topic_summary,
         "corpus_file": str(corpus_path),
-        "papers": [serialize_paper_for_topic(topic, paper) for paper in papers],
+        "papers": [serialize_ranked_paper(topic, paper, paper_rank_map) for paper in papers],
         "items": results,
         "validation": validate_extracted_hotspots(results),
     }
@@ -3175,13 +3658,19 @@ def serialize_targets(limit: int | None = None) -> list[dict[str, Any]]:
 
 def json_response(handler: SimpleHTTPRequestHandler, payload: Any, status: int = 200, headers: dict[str, str] | None = None) -> None:
     body = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
-    handler.send_response(status)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Content-Length", str(len(body)))
-    for key, value in (headers or {}).items():
-        handler.send_header(key, value)
-    handler.end_headers()
-    handler.wfile.write(body)
+    try:
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Content-Length", str(len(body)))
+        for key, value in (headers or {}).items():
+            handler.send_header(key, value)
+        handler.end_headers()
+        handler.wfile.write(body)
+    except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError) as exc:
+        if getattr(exc, "winerror", None) in {10053, 10054} or isinstance(exc, (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)):
+            log_event("client disconnected before response completed", {"path": getattr(handler, "path", ""), "error": str(exc)})
+            return
+        raise
 
 
 def require_api_password(handler: SimpleHTTPRequestHandler, query: dict[str, list[str]] | None = None, payload: dict[str, Any] | None = None) -> bool:

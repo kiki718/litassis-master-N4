@@ -52,6 +52,20 @@ Atmospheric conditions at the Paranal astronomical site were stable.
         evidence_keys = {(item["kind"], item["label"], item["section"], item["quote"]) for item in record.evidence}
         self.assertEqual(len(evidence_keys), len(record.evidence))
 
+    def test_target_search_strict_filter_keeps_only_expanded_targets(self):
+        context = server.build_target_search_context("Procyon optical interferometry")
+        extracted = [
+            {"id": "280310048", "name": "Procyon", "matched_catalog_id": "280310048"},
+            {"id": "HD_61421", "name": "HD 61421", "matched_catalog_id": None},
+            {"id": "HD_100546", "name": "HD 100546", "matched_catalog_id": None},
+        ]
+        kept, filtered = server.constrain_extracted_targets_for_context(extracted, context)
+        kept_names = {item["name"] for item in kept}
+        self.assertIn("Procyon", kept_names)
+        self.assertIn("HD 61421", kept_names)
+        self.assertNotIn("HD 100546", kept_names)
+        self.assertEqual(filtered, 1)
+
     def test_generated_output_contract(self):
         result = server.build_hotspots(limit=2, use_seed=False)
         self.assertTrue(result["validation"]["valid"])

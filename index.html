@@ -6,6 +6,22 @@
     <title>文献助手</title>
     <link rel="stylesheet" href="styles.css" />
     <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+    <script>
+      window.MathJax = {
+        tex: {
+          inlineMath: [["$", "$"], ["\\(", "\\)"]],
+          displayMath: [["$$", "$$"], ["\\[", "\\]"]],
+          processEscapes: true
+        },
+        options: {
+          skipHtmlTags: ["script", "noscript", "style", "textarea", "pre", "code"]
+        },
+        startup: {
+          typeset: false
+        }
+      };
+    </script>
+    <script defer src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
   </head>
   <body>
     <div class="app-shell">
@@ -181,16 +197,16 @@
               <div class="score-block">
                 <div class="score-ring">
                   <strong id="detailHeat">95.5</strong>
-                  <span>heat</span>
+                  <span>rank</span>
                 </div>
                 <div class="score-bars">
-                  <label>文献数量<span id="scorePaperCount">0</span></label>
+                  <label>语义相关<span id="scorePaperCount">0</span></label>
                   <progress id="scorePaperCountBar" value="0" max="35"></progress>
-                  <label>近期关注<span id="scoreRecent">0</span></label>
-                  <progress id="scoreRecentBar" value="0" max="25"></progress>
-                  <label>相关性<span id="scoreRelevance">0</span></label>
-                  <progress id="scoreRelevanceBar" value="0" max="25"></progress>
-                  <label>代表性<span id="scoreRepresentative">0</span></label>
+                  <label>目标/天区<span id="scoreRecent">0</span></label>
+                  <progress id="scoreRecentBar" value="0" max="30"></progress>
+                  <label>全文证据<span id="scoreRelevance">0</span></label>
+                  <progress id="scoreRelevanceBar" value="0" max="20"></progress>
+                  <label>近期趋势<span id="scoreRepresentative">0</span></label>
                   <progress id="scoreRepresentativeBar" value="0" max="15"></progress>
                 </div>
               </div>
@@ -350,7 +366,7 @@
             <i data-lucide="x"></i>
           </button>
         </div>
-        <pre id="markdownPreviewBody">选择已解析的文献后，这里会显示 MinerU 生成的 Markdown。</pre>
+        <div id="markdownPreviewBody">选择已解析的文献后，这里会显示 MinerU 生成的 Markdown。</div>
       </section>
     </div>
 

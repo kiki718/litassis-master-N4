@@ -69,6 +69,57 @@ function escapeHtml(value = "") {
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
 }
+
+function normalizeLatexBlocks(value = "") {
+  let text = String(value || "");
+  if (/\$\$|\\\[|\\\(/.test(text)) return text;
+  return text.replace(
+    /(\\begin\{(?:array|align\*?|equation\*?|gather\*?|split|matrix|pmatrix|bmatrix|cases)\}[\s\S]*?\\end\{(?:array|align\*?|equation\*?|gather\*?|split|matrix|pmatrix|bmatrix|cases)\}(?:\\tag\{[^}]+\})?)/g,
+    "\n$$\n$1\n$$\n"
+  );
+}
+
+function renderMathText(value = "", tag = "span") {
+  const safeTag = ["span", "p", "div"].includes(tag) ? tag : "span";
+  return `<${safeTag} class="math-text">${escapeHtml(normalizeLatexBlocks(value))}</${safeTag}>`;
+}
+
+function renderMarkdownPreview(markdown = "") {
+  const codeBlocks = [];
+  const protectedText = normalizeLatexBlocks(markdown).replace(/```([\s\S]*?)```/g, (_match, code) => {
+    const token = `@@CODE_BLOCK_${codeBlocks.length}@@`;
+    codeBlocks.push(`<pre class="markdown-code"><code>${escapeHtml(code.trim())}</code></pre>`);
+    return token;
+  });
+  const html = escapeHtml(protectedText)
+    .replace(/^######\s+(.+)$/gm, "<h6>$1</h6>")
+    .replace(/^#####\s+(.+)$/gm, "<h5>$1</h5>")
+    .replace(/^####\s+(.+)$/gm, "<h4>$1</h4>")
+    .replace(/^###\s+(.+)$/gm, "<h3>$1</h3>")
+    .replace(/^##\s+(.+)$/gm, "<h2>$1</h2>")
+    .replace(/^#\s+(.+)$/gm, "<h1>$1</h1>")
+    .replace(/^&gt;\s?(.+)$/gm, "<blockquote>$1</blockquote>")
+    .replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/`([^`\n]+)`/g, "<code>$1</code>")
+    .replace(/\n{3,}/g, "\n\n");
+  return codeBlocks.reduce(
+    (content, block, index) => content.replace(`@@CODE_BLOCK_${index}@@`, block),
+    html
+  );
+}
+
+function typesetMath(container, attempts = 0) {
+  if (!container) return;
+  if (!window.MathJax?.typesetPromise) {
+    if (attempts < 20) {
+      window.setTimeout(() => typesetMath(container, attempts + 1), 150);
+    }
+    return;
+  }
+  window.MathJax.typesetPromise([container]).catch((error) => {
+    console.warn("MathJax typeset failed", error);
+  });
+}
 const hotspotList = document.querySelector("#hotspotList");
 const jsonPreview = document.querySelector("#jsonPreview");
 const checks = document.querySelector("#checks");
@@ -85,9 +136,11 @@ function matchedHotspots() {
 function enrichedHotspots() {
   const targetMap = new Map(targets.map((item) => [String(item.id), item]));
   return matchedHotspots().map((item) => ({
+    ...item,
     id: String(item.id),
-    name: targetMap.get(String(item.id))?.name ?? null,
+    name: item.name ?? targetMap.get(String(item.id))?.name ?? null,
     heat: Number(item.heat),
+    rank_score: Number(item.rank_score ?? item.heat ?? 0),
     matched: item.matched,
     papers: item.papers?.length
       ? item.papers
@@ -137,10 +190,10 @@ function setScoreValue(valueId, barId, value, max) {
 }
 
 function renderScoreBreakdown(breakdown = {}) {
-  setScoreValue("#scorePaperCount", "#scorePaperCountBar", breakdown.paper_count, 35);
-  setScoreValue("#scoreRecent", "#scoreRecentBar", breakdown.recent_attention, 25);
-  setScoreValue("#scoreRelevance", "#scoreRelevanceBar", breakdown.llm_relevance, 25);
-  setScoreValue("#scoreRepresentative", "#scoreRepresentativeBar", breakdown.representative, 15);
+  setScoreValue("#scorePaperCount", "#scorePaperCountBar", breakdown.semantic_relevance ?? breakdown.paper_count, 35);
+  setScoreValue("#scoreRecent", "#scoreRecentBar", breakdown.target_region_relevance ?? breakdown.recent_attention, 30);
+  setScoreValue("#scoreRelevance", "#scoreRelevanceBar", breakdown.full_text_evidence ?? breakdown.llm_relevance, 20);
+  setScoreValue("#scoreRepresentative", "#scoreRepresentativeBar", breakdown.recent_trend ?? breakdown.representative, 15);
 }
 
 function selectTarget(id) {
@@ -161,16 +214,26 @@ function selectTarget(id) {
   document.querySelector("#detailTitle").textContent = target.id;
   const relatedPaperCount = hotspot?.related_paper_count ?? target.related_paper_count ?? 0;
   const mentionCount = hotspot?.mention_count ?? target.mention_count ?? 0;
+  const rankScore = Number(hotspot?.rank_score ?? heat ?? 0);
   const referenceText = hotspot?.in_reference_catalog
     ? `参考表ID ${hotspot.reference_catalog_id || hotspot.matched_catalog_id}`
     : "未命中221参考表";
-  document.querySelector("#detailSubtitle").textContent = `${target.name || "TIC " + target.id} · 热度 ${heat || "未匹配"} · 相关文献 ${relatedPaperCount} 篇 · 文本提及 ${mentionCount} 次 · ${referenceText}`;
-  document.querySelector("#detailHeat").textContent = heat || "--";
-  document.querySelector(".score-ring").style.background = `conic-gradient(var(--green) 0 ${Math.min(360, heat * 3.6)}deg, #e8edf2 ${Math.min(360, heat * 3.6)}deg 360deg)`;
+  document.querySelector("#detailSubtitle").textContent = `${target.name || "TIC " + target.id} · 重排分 ${rankScore || "未匹配"} · 相关文献 ${relatedPaperCount} 篇 · 文本提及 ${mentionCount} 次 · ${referenceText}`;
+  document.querySelector("#detailHeat").textContent = rankScore || "--";
+  document.querySelector(".score-ring").style.background = `conic-gradient(var(--green) 0 ${Math.min(360, rankScore * 3.6)}deg, #e8edf2 ${Math.min(360, rankScore * 3.6)}deg 360deg)`;
   renderScoreBreakdown(hotspot?.score_breakdown);
-  document.querySelector("#detailSummary").textContent = hotspot?.summary || (heat
+  const aliases = (hotspot?.aliases || []).slice(0, 5).join("、");
+  const relatedTargets = (hotspot?.related_targets || []).slice(0, 4).map((item) => item.name || item.id).join("、");
+  const reasons = (hotspot?.reasons || hotspot?.match_reasons || []).slice(0, 5).join("；");
+  const summaryParts = [
+    hotspot?.summary || (heat
     ? "近期论文集中讨论该目标的观测可行性、科学收益或目标样本价值，适合进入后续候选目标筛选。"
-    : "当前热点结果未覆盖该目标，后续检索可优先补充目标别名、坐标和星表交叉匹配。");
+    : "当前热点结果未覆盖该目标，后续检索可优先补充目标别名、坐标和星表交叉匹配。"),
+    aliases ? `检索别名：${aliases}` : "",
+    relatedTargets ? `扩展目标：${relatedTargets}` : "",
+    reasons ? `命中理由：${reasons}` : ""
+  ].filter(Boolean);
+  document.querySelector("#detailSummary").textContent = summaryParts.join("\n");
   const related = hotspot?.papers?.length
     ? hotspot.papers.map((paper) => ({ ...paper, targetId: target.id, source: paper.source || "文献源" }))
     : papers.filter((paper) => paper.targetId === String(target.id));
@@ -757,7 +820,8 @@ async function openMarkdownPreview(paperId) {
   try {
     const response = await fetch(`/api/paper/markdown?paper_id=${encodeURIComponent(paperId)}`);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    body.textContent = await response.text();
+    body.innerHTML = renderMarkdownPreview(await response.text());
+    typesetMath(body);
     if (record?.parse_status === "need_review") {
       meta.textContent = `${record.markdown_path || paperId} · 需人工复核`;
     }
@@ -792,7 +856,7 @@ function renderEvidenceRefs(record, refs = []) {
     .map((ref) => `
       <blockquote>
         <strong>${escapeHtml(ref.section || "全文")}</strong>
-        <span>${escapeHtml(ref.quote || "")}</span>
+        ${renderMathText(ref.quote || "", "span")}
       </blockquote>
     `)
     .join("");
@@ -842,7 +906,7 @@ function renderScienceRecord(record) {
       <h3>结论片段</h3>
       ${conclusions.length ? conclusions.map((item) => `
         <article>
-          <p>${escapeHtml(item.text || "")}</p>
+          ${renderMathText(item.text || "", "p")}
           ${renderEvidenceRefs(record, item.evidence_refs)}
         </article>
       `).join("") : "<p>未识别到明确结论句。</p>"}
@@ -870,6 +934,7 @@ async function openScienceInfoModal(paper, paperId) {
     mergeScienceRecord(payload.record);
     meta.textContent = payload.record?.source === "markdown" ? "优先使用 MinerU Markdown 全文" : "未找到全文，使用题名与摘要回退";
     body.innerHTML = renderScienceRecord(payload.record);
+    typesetMath(body);
   } catch (error) {
     meta.textContent = "抽取失败";
     body.innerHTML = `<p>科学信息抽取失败：${escapeHtml(error.message)}</p>`;
