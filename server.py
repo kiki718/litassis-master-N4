@@ -20,10 +20,12 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zipfile
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from xml.etree import ElementTree
@@ -51,6 +53,12 @@ DEFAULT_CONFIG = {
         "args": ["-p", "{pdf_path}", "-o", "{output_dir}"],
         "timeout_seconds": 7200,
         "service_url": "",
+        "api_base": "https://mineru.net",
+        "api_model_version": "vlm",
+        "api_language": "en",
+        "api_enable_formula": True,
+        "api_enable_table": True,
+        "api_poll_interval_seconds": 5,
     },
     "mineru_models": {
         "auto_prepare": True,
@@ -2548,6 +2556,134 @@ def strip_ansi(value: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", value or "")
 
 
+def mineru_api_token() -> str:
+    return clean_text(os.getenv("MINERU_API_TOKEN", ""))
+
+
+def mineru_api_base(config: dict[str, Any]) -> str:
+    return clean_text(str(config.get("api_base") or "https://mineru.net")).rstrip("/")
+
+
+def mineru_api_json_request(config: dict[str, Any], method: str, path: str, payload: dict[str, Any] | None = None, timeout: int = 60) -> dict[str, Any]:
+    token = mineru_api_token()
+    if not token:
+        raise RuntimeError("未配置 MINERU_API_TOKEN，请先在 .env 中填写 MinerU API Token")
+    url = mineru_api_base(config) + path
+    data = json.dumps(payload or {}, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    attempts = max(1, int(config.get("api_request_retries") or 3))
+    last_error: BaseException | None = None
+    body = ""
+    for attempt in range(1, attempts + 1):
+        request = urllib.request.Request(
+            url,
+            data=data,
+            method=method,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Connection": "close",
+                "User-Agent": "LiteratureAssistant/1.0",
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8", errors="replace")
+            break
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")[:1200]
+            raise RuntimeError(f"MinerU API 返回 HTTP {exc.code}：{detail}") from exc
+        except (urllib.error.URLError, TimeoutError, ssl.SSLError) as exc:
+            last_error = exc
+            log_event("MinerU API request failed; retrying", {"method": method, "path": path, "attempt": attempt, "error": str(exc)})
+            if attempt < attempts:
+                time.sleep(min(2 * attempt, 6))
+                continue
+    else:
+        raise RuntimeError(f"MinerU API 请求失败：{last_error}") from last_error
+    try:
+        result = json.loads(body or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"MinerU API 返回非 JSON：{body[:400]}") from exc
+    if not isinstance(result, dict):
+        raise RuntimeError("MinerU API 返回格式异常")
+    code = result.get("code")
+    if code not in {None, 0, "0", 200, "200"} and result.get("ok") is not True:
+        message = result.get("msg") or result.get("message") or result.get("error") or result
+        raise RuntimeError(f"MinerU API 调用失败：{message}")
+    return result
+
+
+def mineru_api_payload_data(result: dict[str, Any]) -> Any:
+    data = result.get("data")
+    if data is None:
+        data = result.get("result")
+    return data if data is not None else result
+
+
+def mineru_download_bytes(url: str, timeout: int = 120) -> bytes:
+    request = urllib.request.Request(url, headers={"User-Agent": "LiteratureAssistant/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:800]
+        raise RuntimeError(f"下载 MinerU 结果失败 HTTP {exc.code}：{detail}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError(f"下载 MinerU 结果失败：{exc}") from exc
+
+
+def mineru_oss_put_bytes(upload_url: str, body: bytes, timeout: int = 300) -> None:
+    parsed = urllib.parse.urlsplit(upload_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise RuntimeError("MinerU 上传地址无效")
+    path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+    connection_class = http.client.HTTPSConnection if parsed.scheme == "https" else http.client.HTTPConnection
+    connection = connection_class(parsed.netloc, timeout=timeout)
+    try:
+        connection.putrequest("PUT", path, skip_accept_encoding=True)
+        connection.putheader("Host", parsed.netloc)
+        connection.putheader("Content-Length", str(len(body)))
+        connection.putheader("Connection", "close")
+        connection.endheaders()
+        for start in range(0, len(body), 1024 * 1024):
+            connection.send(body[start : start + 1024 * 1024])
+        response = connection.getresponse()
+        response_body = response.read().decode("utf-8", errors="replace")
+        if response.status >= 400:
+            raise RuntimeError(f"上传 PDF 到 MinerU 失败 HTTP {response.status}：{response_body[:1200]}")
+    finally:
+        connection.close()
+
+
+def extract_markdown_from_zip_bytes(archive_bytes: bytes) -> str:
+    with zipfile.ZipFile(BytesIO(archive_bytes)) as archive:
+        names = [name for name in archive.namelist() if name.lower().endswith(".md")]
+        if not names:
+            raise RuntimeError("MinerU 结果压缩包中未找到 Markdown 文件")
+        names.sort(key=lambda name: (Path(name).name.lower() != "full.md", len(name)))
+        with archive.open(names[0]) as file:
+            return file.read().decode("utf-8", errors="replace")
+
+
+def first_present(value: Any, keys: list[str]) -> Any:
+    if not isinstance(value, dict):
+        return None
+    for key in keys:
+        item = value.get(key)
+        if item is None:
+            continue
+        if isinstance(item, str) and item == "":
+            continue
+        return item
+    return None
+
+
+def is_ssl_eof_error(exc: BaseException) -> bool:
+    text = str(exc)
+    return "EOF occurred in violation of protocol" in text or "UNEXPECTED_EOF_WHILE_READING" in text
+
+
 def infer_parse_progress(task: ParseTask) -> ParseTask:
     if task.status not in {"queued", "running"}:
         return task
@@ -2623,7 +2759,16 @@ class MinerUAdapter:
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         self.config = config or {}
 
-    def parse(self, record: PaperRecord) -> tuple[str, Path | None, str | None]:
+    def _update_task(self, task: ParseTask | None, percent: float, stage: str, message: str | None = None) -> None:
+        if not task:
+            return
+        task.progress_percent = max(0, min(100, percent))
+        task.progress_stage = stage
+        if message:
+            task.message = message
+        save_parse_task(task)
+
+    def parse(self, record: PaperRecord, task: ParseTask | None = None) -> tuple[str, Path | None, str | None]:
         pdf_path = resolve_record_pdf_path(record)
         if not pdf_path:
             return "failed", None, "PDF 文件不存在或路径无效，请先重新获取 PDF"
@@ -2631,6 +2776,8 @@ class MinerUAdapter:
         output_dir.mkdir(parents=True, exist_ok=True)
         preferred_path = output_dir / f"{safe_filename(record.paper_id, 120)}.md"
         mode = clean_text(str(self.config.get("mode") or "command")).lower()
+        if mode in {"official_api", "api", "mineru_api"}:
+            return self._parse_with_official_api(record, pdf_path, output_dir, preferred_path, task)
         if mode == "service":
             return self._parse_with_service(record, pdf_path, output_dir, preferred_path)
         models_ready, models_message = prepare_mineru_models(self.config, output_dir)
@@ -2698,6 +2845,151 @@ class MinerUAdapter:
             return "failed", None, f"MinerU 未生成 Markdown 文件。{message}"
         review_reason = markdown_needs_review(md_path)
         return ("need_review" if review_reason else "success"), md_path, review_reason
+
+    def _parse_with_official_api(self, record: PaperRecord, pdf_path: Path, output_dir: Path, markdown_path: Path, task: ParseTask | None = None) -> tuple[str, Path | None, str | None]:
+        if not mineru_api_token():
+            return "failed", None, "未配置 MINERU_API_TOKEN，请先在 .env 中填写 MinerU API Token"
+        timeout = int(self.config.get("timeout_seconds") or 7200)
+        poll_interval = max(2, int(self.config.get("api_poll_interval_seconds") or 5))
+        output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self._update_task(task, 2, "申请 MinerU 官方 API 上传地址")
+            pdf_body = pdf_path.read_bytes()
+            upload_info = self._official_api_create_batch(record, pdf_path)
+            upload_url = upload_info["upload_url"]
+            batch_id = upload_info["batch_id"]
+            self._update_task(task, 8, "上传 PDF 到 MinerU 官方 API")
+            self._official_api_upload_pdf(upload_url, pdf_body)
+            self._update_task(task, 20, "等待 MinerU 云端解析结果")
+            result = self._official_api_wait_for_result(batch_id, timeout, poll_interval, task)
+            self._update_task(task, 92, "下载 MinerU Markdown 结果")
+            markdown = self._official_api_result_markdown(result)
+            markdown_path.write_text(markdown, encoding="utf-8")
+        except Exception as exc:
+            return "failed", None, f"MinerU 官方 API 解析失败：{exc}"
+        review_reason = markdown_needs_review(markdown_path)
+        return ("need_review" if review_reason else "success"), markdown_path, review_reason
+
+    def _official_api_create_batch(self, record: PaperRecord, pdf_path: Path) -> dict[str, str]:
+        filename = safe_filename(pdf_path.name or f"{record.paper_id}.pdf", 120)
+        payload = {
+            "enable_formula": config_bool(self.config.get("api_enable_formula"), True),
+            "enable_table": config_bool(self.config.get("api_enable_table"), True),
+            "language": clean_text(str(self.config.get("api_language") or "en")),
+            "files": [
+                {
+                    "name": filename,
+                    "is_ocr": config_bool(self.config.get("api_is_ocr"), False),
+                    "data_id": record.paper_id,
+                }
+            ],
+        }
+        model_version = clean_text(str(self.config.get("api_model_version") or "vlm"))
+        if model_version:
+            payload["model_version"] = model_version
+        extra_formats = self.config.get("api_extra_formats")
+        if isinstance(extra_formats, list) and extra_formats:
+            payload["extra_formats"] = extra_formats
+        result = mineru_api_json_request(self.config, "POST", "/api/v4/file-urls/batch", payload, timeout=60)
+        data = mineru_api_payload_data(result)
+        if not isinstance(data, dict):
+            raise RuntimeError("申请上传地址失败：MinerU API 未返回 data")
+        batch_id = clean_text(str(first_present(data, ["batch_id", "batchId", "id"]) or ""))
+        raw_urls = first_present(data, ["file_urls", "fileUrls", "urls", "upload_urls", "uploadUrls"])
+        upload_url = ""
+        if isinstance(raw_urls, list) and raw_urls:
+            first = raw_urls[0]
+            upload_url = clean_text(str(first.get("url") if isinstance(first, dict) else first))
+        elif isinstance(raw_urls, dict):
+            upload_url = clean_text(str(first_present(raw_urls, ["url", "upload_url", "uploadUrl"]) or ""))
+        if not batch_id:
+            raise RuntimeError(f"申请上传地址失败：缺少 batch_id，返回 {data}")
+        if not upload_url:
+            raise RuntimeError(f"申请上传地址失败：缺少 file_urls，返回 {data}")
+        return {"batch_id": batch_id, "upload_url": upload_url}
+
+    def _official_api_upload_pdf(self, upload_url: str, pdf_body: bytes) -> None:
+        attempts = max(1, int(self.config.get("api_upload_retries") or 3))
+        last_error: BaseException | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                mineru_oss_put_bytes(upload_url, pdf_body)
+                return
+            except (urllib.error.URLError, TimeoutError, ssl.SSLError, OSError, http.client.HTTPException) as exc:
+                last_error = exc
+                if is_ssl_eof_error(exc):
+                    log_event("MinerU API upload ended with SSL EOF; continuing to result polling", {"attempt": attempt})
+                    return
+                if attempt < attempts:
+                    time.sleep(min(2 * attempt, 6))
+                    continue
+        raise RuntimeError(f"上传 PDF 到 MinerU 失败：{last_error}")
+
+    def _official_api_wait_for_result(self, batch_id: str, timeout: int, poll_interval: int, task: ParseTask | None = None) -> dict[str, Any]:
+        deadline = time.time() + timeout
+        started = time.time()
+        last_result: dict[str, Any] = {}
+        while time.time() < deadline:
+            elapsed = max(0.0, time.time() - started)
+            progress = min(90.0, 20.0 + elapsed / max(60.0, timeout) * 70.0)
+            self._update_task(task, progress, "等待 MinerU 云端解析结果")
+            try:
+                result = mineru_api_json_request(self.config, "GET", f"/api/v4/extract-results/batch/{urllib.parse.quote(batch_id)}", timeout=60)
+            except RuntimeError as exc:
+                if is_ssl_eof_error(exc):
+                    self._update_task(task, progress, "等待 MinerU 云端解析结果（网络重试中）", str(exc)[:240])
+                    time.sleep(poll_interval)
+                    continue
+                raise
+            data = mineru_api_payload_data(result)
+            last_result = data if isinstance(data, dict) else result
+            status, message = self._official_api_status(last_result)
+            if status in {"done", "success"}:
+                return last_result
+            if status in {"failed", "error"}:
+                raise RuntimeError(message or f"任务 {batch_id} 解析失败")
+            time.sleep(poll_interval)
+        raise RuntimeError(f"任务 {batch_id} 等待超时，最后状态：{last_result}")
+
+    def _official_api_status(self, result: dict[str, Any]) -> tuple[str, str]:
+        candidates: list[dict[str, Any]] = []
+        for key in ["extract_result", "extractResult", "results", "files", "tasks"]:
+            value = result.get(key)
+            if isinstance(value, list):
+                candidates.extend(item for item in value if isinstance(item, dict))
+        if isinstance(result.get("file"), dict):
+            candidates.append(result["file"])
+        candidates.append(result)
+        statuses = [clean_text(str(first_present(item, ["state", "status", "extract_status", "extractStatus"]) or "")).lower() for item in candidates]
+        message = clean_text(str(first_present(candidates[0], ["err_msg", "error", "message", "msg"]) or "")) if candidates else ""
+        if any(status in {"failed", "fail", "error"} for status in statuses):
+            return "failed", message
+        if any(status in {"done", "success", "completed", "finish", "finished"} for status in statuses):
+            return "success", message
+        return "running", message
+
+    def _official_api_result_markdown(self, result: dict[str, Any]) -> str:
+        candidates: list[Any] = [result]
+        for key in ["extract_result", "extractResult", "results", "files", "tasks"]:
+            value = result.get(key)
+            if isinstance(value, list):
+                candidates.extend(value)
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            markdown = first_present(item, ["markdown", "md", "content"])
+            if isinstance(markdown, str) and markdown.strip():
+                return markdown
+            md_url = first_present(item, ["md_url", "mdUrl", "markdown_url", "markdownUrl", "full_md_url", "fullMdUrl"])
+            if isinstance(md_url, str) and md_url.strip():
+                return mineru_download_bytes(md_url).decode("utf-8", errors="replace")
+            zip_url = first_present(item, ["full_zip_url", "fullZipUrl", "zip_url", "zipUrl", "result_url", "resultUrl"])
+            if isinstance(zip_url, str) and zip_url.strip():
+                data = mineru_download_bytes(zip_url)
+                if data[:2] == b"PK":
+                    return extract_markdown_from_zip_bytes(data)
+                return data.decode("utf-8", errors="replace")
+        raise RuntimeError(f"MinerU API 结果中未找到 Markdown 或结果下载链接：{result}")
 
     def _parse_with_service(self, record: PaperRecord, pdf_path: Path, output_dir: Path, markdown_path: Path) -> tuple[str, Path | None, str | None]:
         service_url = clean_text(str(self.config.get("service_url") or ""))
@@ -2785,12 +3077,13 @@ def run_parse_task(task_id: str) -> int:
     task.started_at = datetime.now().isoformat(timespec="seconds")
     task.message = "MinerU 解析中"
     task.progress_percent = 1
-    task.progress_stage = "准备 MinerU 模型"
+    adapter_mode = clean_text(str((CONFIG.get("mineru_adapter") or {}).get("mode") or "command")).lower()
+    task.progress_stage = "提交 MinerU 官方 API" if adapter_mode in {"official_api", "api", "mineru_api"} else "准备 MinerU 模型"
     record = mark_record_parse_running(record, task)
     task.record = asdict(record)
     save_parse_task(task)
     try:
-        parse_status, markdown_path, message = MinerUAdapter(CONFIG.get("mineru_adapter", {})).parse(record)
+        parse_status, markdown_path, message = MinerUAdapter(CONFIG.get("mineru_adapter", {})).parse(record, task)
         updated = update_record_after_parse(record, parse_status, markdown_path, message)
         task.parse_status = parse_status
         task.status = "success" if parse_status == "success" else parse_status

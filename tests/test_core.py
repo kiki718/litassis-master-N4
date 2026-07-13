@@ -1,6 +1,7 @@
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import server
 
@@ -65,6 +66,53 @@ Atmospheric conditions at the Paranal astronomical site were stable.
         self.assertIn("HD 61421", kept_names)
         self.assertNotIn("HD 100546", kept_names)
         self.assertEqual(filtered, 1)
+
+    def test_first_present_accepts_list_values(self):
+        value = server.first_present({"file_urls": ["https://example.test/upload"]}, ["file_urls"])
+        self.assertEqual(value, ["https://example.test/upload"])
+
+    def test_ssl_eof_error_detection(self):
+        self.assertTrue(server.is_ssl_eof_error(RuntimeError("EOF occurred in violation of protocol (_ssl.c:2406)")))
+        self.assertTrue(server.is_ssl_eof_error(RuntimeError("SSL: UNEXPECTED_EOF_WHILE_READING")))
+        self.assertFalse(server.is_ssl_eof_error(RuntimeError("HTTP 403")))
+
+    def test_mineru_oss_put_omits_content_type(self):
+        calls = []
+
+        class FakeResponse:
+            status = 200
+
+            def read(self):
+                return b""
+
+        class FakeConnection:
+            def __init__(self, netloc, timeout=0):
+                self.netloc = netloc
+                self.timeout = timeout
+
+            def putrequest(self, *args, **kwargs):
+                calls.append(("putrequest", args, kwargs))
+
+            def putheader(self, *args):
+                calls.append(("putheader", args))
+
+            def endheaders(self):
+                calls.append(("endheaders",))
+
+            def send(self, body):
+                calls.append(("send", body))
+
+            def getresponse(self):
+                return FakeResponse()
+
+            def close(self):
+                calls.append(("close",))
+
+        with patch.object(server.http.client, "HTTPSConnection", FakeConnection):
+            server.mineru_oss_put_bytes("https://example.test/upload?a=1", b"%PDF-1.7")
+
+        header_names = [item[1][0].lower() for item in calls if item[0] == "putheader"]
+        self.assertNotIn("content-type", header_names)
 
     def test_generated_output_contract(self):
         result = server.build_hotspots(limit=2, use_seed=False)

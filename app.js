@@ -70,8 +70,23 @@ function escapeHtml(value = "") {
     .replaceAll("'", "&#39;");
 }
 
+function hasUnescapedAmpersand(value = "") {
+  return /(^|[^\\])&/.test(String(value || ""));
+}
+
+function repairDisplayLatex(value = "") {
+  const text = String(value || "").trim();
+  if (!hasUnescapedAmpersand(text)) return text;
+  if (/\\begin\{(?:aligned|align\*?|array|matrix|pmatrix|bmatrix|cases)\}/.test(text)) return text;
+  if (/\\begin\{/.test(text)) return text;
+  return `\\begin{aligned}\n${text}\n\\end{aligned}`;
+}
+
 function normalizeLatexBlocks(value = "") {
   let text = String(value || "");
+  text = text
+    .replace(/\$\$([\s\S]*?)\$\$/g, (_match, body) => `$$\n${repairDisplayLatex(body)}\n$$`)
+    .replace(/\\\[([\s\S]*?)\\\]/g, (_match, body) => `\\[\n${repairDisplayLatex(body)}\n\\]`);
   if (/\$\$|\\\[|\\\(/.test(text)) return text;
   return text.replace(
     /(\\begin\{(?:array|align\*?|equation\*?|gather\*?|split|matrix|pmatrix|bmatrix|cases)\}[\s\S]*?\\end\{(?:array|align\*?|equation\*?|gather\*?|split|matrix|pmatrix|bmatrix|cases)\}(?:\\tag\{[^}]+\})?)/g,
@@ -84,6 +99,14 @@ function renderMathText(value = "", tag = "span") {
   return `<${safeTag} class="math-text">${escapeHtml(normalizeLatexBlocks(value))}</${safeTag}>`;
 }
 
+function restoreSafeInlineHtml(value = "") {
+  return String(value)
+    .replace(/&lt;(sup|sub)&gt;([^<>]{0,80})&lt;\/\1&gt;/gi, (_match, tag, content) => {
+      const safeTag = tag.toLowerCase();
+      return `<${safeTag}>${content}</${safeTag}>`;
+    });
+}
+
 function renderMarkdownPreview(markdown = "") {
   const codeBlocks = [];
   const protectedText = normalizeLatexBlocks(markdown).replace(/```([\s\S]*?)```/g, (_match, code) => {
@@ -91,7 +114,7 @@ function renderMarkdownPreview(markdown = "") {
     codeBlocks.push(`<pre class="markdown-code"><code>${escapeHtml(code.trim())}</code></pre>`);
     return token;
   });
-  const html = escapeHtml(protectedText)
+  const html = restoreSafeInlineHtml(escapeHtml(protectedText))
     .replace(/^######\s+(.+)$/gm, "<h6>$1</h6>")
     .replace(/^#####\s+(.+)$/gm, "<h5>$1</h5>")
     .replace(/^####\s+(.+)$/gm, "<h4>$1</h4>")

@@ -13,7 +13,15 @@
     "command": "mineru",
     "args": ["-p", "{pdf_path}", "-o", "{output_dir}", "-b", "pipeline", "-m", "auto"],
     "timeout_seconds": 7200,
-    "service_url": ""
+    "service_url": "",
+    "api_base": "https://mineru.net",
+    "api_model_version": "vlm",
+    "api_language": "en",
+    "api_enable_formula": true,
+    "api_enable_table": true,
+    "api_poll_interval_seconds": 5,
+    "api_request_retries": 3,
+    "api_upload_retries": 3
   },
   "mineru_models": {
     "auto_prepare": true,
